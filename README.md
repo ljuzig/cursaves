@@ -199,7 +199,7 @@ cursaves pull              # pull + import into Cursor's database
 # Then restart Cursor to see the imported conversations
 ```
 
-The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts.
+The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts. If a conversation has diverged (local and snapshot histories are no longer append-only), `sync` aborts before importing or pushing changes. `--force` does not override that.
 
 ## Commands
 

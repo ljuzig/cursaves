@@ -1,0 +1,1061 @@
+"""Semantic sync classification: prefix compare, not message counts.
+
+Authoritative relation is a prefix comparison of per-message semantic
+unit hashes. ``messageCount`` is never used to decide a write.
+
+Lookup is origin-aware: ``(project_identifier, composer_id)``, with the
+Commit 1 SSH rules (exact host + POSIX-normalized remote path). There is
+no cross-project or cross-host fallback.
+
+A regenerable on-disk cache stores snapshot and local fingerprints so
+legacy gzip and local semantic parses are not repeated every command.
+The cache is never authoritative when missing or stale. Snapshot files
+are never rewritten.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+from . import db, export, importer, paths
+
+
+class SyncRelation(str, Enum):
+    UP_TO_DATE = "up_to_date"
+    LOCAL_AHEAD = "local_ahead"
+    BEHIND = "behind"
+    DIVERGED = "diverged"
+    NEVER_PUSHED = "never_pushed"
+    UNKNOWN = "unknown"
+
+
+NOT_LOCAL = "not_local"
+
+# Top-level cursaves envelope — never part of conversation meaning.
+_NON_SEMANTIC_SNAPSHOT_KEYS = frozenset({
+    "exportedAt",
+    "sourceMachine",
+    "sourceHost",
+    "sourceProjectPath",
+    "projectIdentifier",
+})
+
+# Proven transport-only fields, stripped only at header/bubble roots.
+_TOP_LEVEL_TRANSPORT_KEYS = frozenset({
+    "createdAt",
+    "lastUpdatedAt",
+    "exportedAt",
+    "checkpointId",
+    "serverBubbleId",
+})
+
+_EXPLICIT_BLOB_KEYS = frozenset({"contentHash", "blobId", "contentHashes"})
+
+_CACHE_VERSION = 3
+SEMANTIC_DIGEST_VERSION = 1
+_HASH_CHUNK = 1024 * 1024
+
+
+class ClassifyError(Exception):
+    """Conversation cannot be classified safely."""
+
+
+@dataclass
+class OpCounts:
+    sqlite_backups: int = 0
+    snapshot_directory_scans: int = 0
+    deep_snapshot_reads: int = 0
+    legacy_snapshot_decompressions: int = 0
+    full_local_exports: int = 0
+    cursor_write_connections: int = 0
+    local_semantic_rehashes: int = 0
+    local_inventory_json_parses: int = 0
+
+
+_counts = OpCounts()
+
+
+def reset_op_counts() -> None:
+    global _counts
+    _counts = OpCounts()
+
+
+def op_counts() -> OpCounts:
+    return _counts
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return _sha256_bytes(text.encode("utf-8"))
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _as_bytes(val: Any) -> bytes:
+    if val is None:
+        return b""
+    if isinstance(val, bytes):
+        return val
+    if isinstance(val, str):
+        return val.encode("utf-8")
+    return _canonical_json(val).encode("utf-8")
+
+
+def _hash_field(hasher: Any, key: bytes, value: bytes) -> None:
+    hasher.update(len(key).to_bytes(8, "big"))
+    hasher.update(key)
+    hasher.update(len(value).to_bytes(8, "big"))
+    hasher.update(value)
+
+
+def _hash_file_field(hasher: Any, key: bytes, path: Path) -> None:
+    hasher.update(len(key).to_bytes(8, "big"))
+    hasher.update(key)
+    hasher.update(path.stat().st_size.to_bytes(8, "big"))
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(_HASH_CHUNK)
+            if not chunk:
+                break
+            hasher.update(chunk)
+
+
+def _normalize_unit_object(obj: Any, *, top: bool = False) -> Any:
+    """Include-by-default. Drop only proven root-level transport keys."""
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if top and key in _TOP_LEVEL_TRANSPORT_KEYS:
+                continue
+            out[key] = _normalize_unit_object(value, top=False)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_normalize_unit_object(v, top=False) for v in obj]
+    return obj
+
+
+def _walk_strings(obj: Any) -> Iterator[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _walk_strings(value)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            yield from _walk_strings(value)
+
+
+def _blob_bytes(value: Any) -> bytes:
+    return _as_bytes(value)
+
+
+def _explicit_blob_refs(obj: Any) -> list[str]:
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in _EXPLICIT_BLOB_KEYS:
+                if isinstance(value, str):
+                    found.append(value)
+                elif isinstance(value, list):
+                    found.extend(v for v in value if isinstance(v, str))
+            else:
+                found.extend(_explicit_blob_refs(value))
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            found.extend(_explicit_blob_refs(value))
+    return found
+
+
+def _referenced_blob_ids(payload: Any, available: set[str]) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for text in list(_walk_strings(payload)) + _explicit_blob_refs(payload):
+        if text in available and text not in seen:
+            seen.add(text)
+            found.append(text)
+    return found
+
+
+def _required_blob_ids(payload: Any, available: set[str]) -> list[str]:
+    required: list[str] = []
+    seen: set[str] = set()
+    for text in _explicit_blob_refs(payload):
+        if text not in seen:
+            seen.add(text)
+            required.append(text)
+    for text in _walk_strings(payload):
+        if text in available and text not in seen:
+            seen.add(text)
+            required.append(text)
+    return required
+
+
+def _unit_payload(header: dict, bubble: dict, blobs: dict[str, Any]) -> dict[str, Any]:
+    """Hash header, bubble, and blobs. Snapshot envelope keys never enter here."""
+    payload: dict[str, Any] = {
+        "header": _normalize_unit_object(header, top=True),
+        "bubble": _normalize_unit_object(bubble, top=True),
+    }
+    refs = _referenced_blob_ids((header, bubble), set(blobs))
+    if refs:
+        payload["blobs"] = {
+            ref: _sha256_bytes(_blob_bytes(blobs[ref])) for ref in sorted(refs)
+        }
+    return payload
+
+
+def unit_hash(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> str:
+    if bubble is None:
+        raise ClassifyError("referenced bubble is missing")
+    return _sha256_text(_canonical_json(_unit_payload(header, bubble, blobs)))
+
+
+def conversation_digest(unit_hashes: list[str]) -> str:
+    return "sha256:" + _sha256_text("\n".join(unit_hashes))
+
+
+def compare_unit_hashes(local: list[str], remote: list[str]) -> SyncRelation:
+    if local == remote:
+        return SyncRelation.UP_TO_DATE
+    if len(local) > len(remote) and local[: len(remote)] == remote:
+        return SyncRelation.LOCAL_AHEAD
+    if len(remote) > len(local) and remote[: len(local)] == local:
+        return SyncRelation.BEHIND
+    return SyncRelation.DIVERGED
+
+
+def _headers(composer_data: Optional[dict]) -> list[dict]:
+    if not composer_data:
+        return []
+    headers = composer_data.get("fullConversationHeadersOnly") or []
+    return [h for h in headers if isinstance(h, dict)]
+
+
+def _bubble_from_snapshot(snapshot: dict, bubble_id: str) -> Optional[dict]:
+    entries = snapshot.get("bubbleEntries") or {}
+    if bubble_id in entries:
+        return entries[bubble_id]
+    composer = snapshot.get("composerData") or {}
+    cmap = composer.get("conversationMap") or {}
+    if isinstance(cmap, dict) and bubble_id in cmap:
+        return cmap[bubble_id]
+    return None
+
+
+def snapshot_unit_hashes(snapshot: dict) -> list[str]:
+    """Build unit hashes from a parsed snapshot dict (legacy-safe)."""
+    if not isinstance(snapshot, dict):
+        raise ClassifyError("snapshot is not an object")
+    composer = snapshot.get("composerData")
+    if composer is None:
+        raise ClassifyError("snapshot is missing composerData")
+    if not isinstance(composer, dict):
+        raise ClassifyError("composerData is not an object")
+
+    blobs = snapshot.get("contentBlobs") or {}
+    if not isinstance(blobs, dict):
+        blobs = {}
+    headers = _headers(composer)
+    hashes: list[str] = []
+    for header in headers:
+        bid = header.get("bubbleId")
+        if not bid:
+            raise ClassifyError("header is missing bubbleId")
+        bubble = _bubble_from_snapshot(snapshot, bid)
+        if bubble is None:
+            raise ClassifyError(f"referenced bubble is missing: {bid}")
+        refs = _required_blob_ids((header, bubble), set(blobs))
+        for ref in refs:
+            if ref not in blobs:
+                raise ClassifyError(f"referenced blob missing: {ref}")
+        hashes.append(unit_hash(header, bubble, blobs))
+    return hashes
+
+
+def snapshot_semantic_digest(snapshot: dict) -> str:
+    return conversation_digest(snapshot_unit_hashes(snapshot))
+
+
+def _file_identity(path: Path) -> tuple[int, int, int]:
+    st = path.stat()
+    ctime_ns = getattr(st, "st_ctime_ns", 0)
+    return (st.st_size, st.st_mtime_ns, ctime_ns)
+
+
+def snapshot_source_identity(
+    snapshot_path: Path, meta: Optional[dict] = None
+) -> tuple[tuple[int, int, int], ...]:
+    """Identity of every file ``read_snapshot_file`` would consult."""
+    parts: list[tuple[int, int, int]] = []
+    for path in importer.snapshot_component_files(snapshot_path, meta):
+        try:
+            parts.append(_file_identity(path))
+        except OSError:
+            continue
+    return tuple(parts) if parts else ((0, 0, 0),)
+
+
+def snapshot_content_digest(
+    snapshot_path: Path, meta: Optional[dict] = None
+) -> str:
+    """Hash on-disk compressed bytes of main + shards. No decompress or JSON."""
+    hasher = hashlib.sha256()
+    for path in importer.snapshot_component_files(snapshot_path, meta):
+        _hash_file_field(hasher, path.name.encode("utf-8"), path)
+    return "sha256:" + hasher.hexdigest()
+
+
+def _identity_as_lists(
+    identity: tuple[tuple[int, int, int], ...],
+) -> list[list[int]]:
+    return [list(part) for part in identity]
+
+
+def _identity_from_stored(stored: Any) -> Optional[tuple[tuple[int, int, int], ...]]:
+    if not isinstance(stored, list) or not stored:
+        return None
+    parts: list[tuple[int, int, int]] = []
+    for item in stored:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return None
+        try:
+            parts.append((int(item[0]), int(item[1]), int(item[2])))
+        except (TypeError, ValueError):
+            return None
+    return tuple(parts)
+
+
+def _cache_file() -> Path:
+    return paths.get_cache_dir() / "sync-semantics.json"
+
+
+def _empty_cache() -> dict:
+    return {"version": _CACHE_VERSION, "snapshots": {}, "local": {}}
+
+
+class SemanticsCache:
+    """Optional regenerable cache. Invalid/missing entries are recomputed."""
+
+    def __init__(self):
+        self._data = _empty_cache()
+        self._dirty = False
+        path = _cache_file()
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text())
+                if loaded.get("version") == _CACHE_VERSION:
+                    loaded.setdefault("snapshots", {})
+                    loaded.setdefault("local", {})
+                    self._data = loaded
+            except (json.JSONDecodeError, OSError):
+                self._data = _empty_cache()
+
+    @staticmethod
+    def snapshot_key(project_identifier: str, composer_id: str) -> str:
+        return f"{project_identifier}|{composer_id}"
+
+    def get_snapshot(
+        self,
+        key: str,
+        identity: tuple[tuple[int, int, int], ...],
+    ) -> Optional[dict]:
+        rec = self._data["snapshots"].get(key)
+        if not isinstance(rec, dict) or not rec.get("semanticDigest"):
+            return None
+        if rec.get("semanticDigestVersion") != SEMANTIC_DIGEST_VERSION:
+            return None
+        if _identity_from_stored(rec.get("sourceIdentity")) != identity:
+            return None
+        return rec
+
+    def put_snapshot(
+        self,
+        key: str,
+        identity: tuple[tuple[int, int, int], ...],
+        digest: str,
+    ) -> None:
+        self._data["snapshots"][key] = {
+            "sourceIdentity": _identity_as_lists(identity),
+            "semanticDigest": digest,
+            "semanticDigestVersion": SEMANTIC_DIGEST_VERSION,
+        }
+        self._dirty = True
+
+    def get_local(self, composer_id: str) -> Optional[dict]:
+        rec = self._data["local"].get(composer_id)
+        if not isinstance(rec, dict):
+            return None
+        if not rec.get("rowFingerprint") or not rec.get("semanticDigest"):
+            return None
+        if rec.get("semanticDigestVersion") != SEMANTIC_DIGEST_VERSION:
+            return None
+        if "blobRefs" not in rec or not rec.get("blobFingerprint"):
+            return None
+        return rec
+
+    def put_local(
+        self,
+        composer_id: str,
+        row_fp: str,
+        blob_refs: list[str],
+        blob_fp: str,
+        digest: str,
+    ) -> None:
+        self._data["local"][composer_id] = {
+            "rowFingerprint": row_fp,
+            "blobRefs": list(blob_refs),
+            "blobFingerprint": blob_fp,
+            "semanticDigest": digest,
+            "semanticDigestVersion": SEMANTIC_DIGEST_VERSION,
+        }
+        self._dirty = True
+
+    def flush(self) -> None:
+        if not self._dirty:
+            return
+        path = _cache_file()
+        tmp_name = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix="sync-semantics-",
+                suffix=".tmp",
+                dir=str(path.parent),
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._data, handle, separators=(",", ":"))
+            os.replace(tmp_name, path)
+            tmp_name = None
+            self._dirty = False
+        except (OSError, TypeError, ValueError):
+            self._dirty = False
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+
+@dataclass
+class SnapshotRecord:
+    composer_id: str
+    path: Path
+    meta: dict
+    project_dir: Path
+    project_identifier: str
+    identity: tuple[tuple[int, int, int], ...] = ((0, 0, 0),)
+    invalid_origin: bool = False
+
+
+@dataclass
+class SnapshotIndex:
+    """One-pass origin-aware index. Parsed JSON is not retained."""
+
+    by_key: dict[tuple[str, str], SnapshotRecord] = field(default_factory=dict)
+    _remote_units: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    _remote_digest: dict[tuple[str, str], str] = field(default_factory=dict)
+    cache: SemanticsCache = field(default_factory=SemanticsCache)
+
+    @classmethod
+    def build(cls, snapshots_dir: Optional[Path] = None) -> "SnapshotIndex":
+        _counts.snapshot_directory_scans += 1
+        root = snapshots_dir if snapshots_dir is not None else paths.get_snapshots_dir()
+        index = cls()
+        if not root.exists():
+            return index
+        for project_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+            for snap_path in importer.list_snapshot_files(project_dir):
+                stem = snap_path.name
+                if stem.endswith(".json.gz"):
+                    stem = stem[: -len(".json.gz")]
+                elif stem.endswith(".json"):
+                    stem = stem[: -len(".json")]
+                meta_path = snap_path.parent / f"{stem}.meta.json"
+                meta: dict = {}
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text())
+                    except (json.JSONDecodeError, OSError):
+                        meta = {}
+                cid = meta.get("composerId") or stem
+                if not cid:
+                    continue
+                project_id = project_dir.name
+                meta_project_id = meta.get("projectIdentifier")
+                invalid_origin = bool(meta_project_id and meta_project_id != project_id)
+                identity = snapshot_source_identity(snap_path, meta)
+                rec = SnapshotRecord(
+                    composer_id=cid,
+                    path=snap_path,
+                    meta=meta,
+                    project_dir=project_dir,
+                    project_identifier=project_id,
+                    identity=identity,
+                    invalid_origin=invalid_origin,
+                )
+                index.by_key[(project_id, cid)] = rec
+        return index
+
+    def get(
+        self,
+        composer_id: str,
+        project_identifier: Optional[str] = None,
+        *,
+        source_host: Optional[str] = None,
+        source_path: Optional[str] = None,
+    ) -> Optional[SnapshotRecord]:
+        if not project_identifier:
+            return None
+        rec = self.by_key.get((project_identifier, composer_id))
+        if rec is None:
+            return None
+        if source_host:
+            if rec.meta.get("sourceHost") != source_host:
+                return None
+            if source_path:
+                got = paths.normalize_origin_path(
+                    rec.meta.get("sourceProjectPath") or "", source_host=source_host
+                )
+                want = paths.normalize_origin_path(source_path, source_host=source_host)
+                if got != want:
+                    return None
+        return rec
+
+    def remote_semantics(self, rec: SnapshotRecord) -> tuple[Optional[list[str]], Optional[str]]:
+        """Return (unit_hashes or None, digest or None). JSON is discarded."""
+        if rec.invalid_origin:
+            raise ClassifyError("snapshot projectIdentifier does not match directory")
+        key = (rec.project_identifier, rec.composer_id)
+        if key in self._remote_digest:
+            return self._remote_units.get(key), self._remote_digest[key]
+
+        cache_key = SemanticsCache.snapshot_key(
+            rec.project_identifier, rec.composer_id
+        )
+        cached = self.cache.get_snapshot(cache_key, rec.identity)
+        if cached:
+            digest = cached["semanticDigest"]
+            self._remote_digest[key] = digest
+            return None, digest
+
+        if self._sidecar_bound_to_body(rec):
+            digest = rec.meta["semanticDigest"]
+            self._remote_digest[key] = digest
+            self.cache.put_snapshot(cache_key, rec.identity, digest)
+            return None, digest
+
+        return self._load_remote_from_file(rec)
+
+    @staticmethod
+    def _sidecar_bound_to_body(rec: SnapshotRecord) -> bool:
+        """Trust sidecar semanticDigest only when on-disk bytes still match."""
+        meta_digest = rec.meta.get("semanticDigest")
+        meta_ver = rec.meta.get("semanticDigestVersion")
+        content = rec.meta.get("snapshotContentDigest")
+        if not (meta_digest and content and meta_ver == SEMANTIC_DIGEST_VERSION):
+            return False
+        try:
+            return snapshot_content_digest(rec.path, rec.meta) == content
+        except OSError:
+            return False
+
+    def _load_remote_from_file(self, rec: SnapshotRecord) -> tuple[list[str], str]:
+        key = (rec.project_identifier, rec.composer_id)
+        _counts.deep_snapshot_reads += 1
+        _counts.legacy_snapshot_decompressions += 1
+        try:
+            data = importer.read_snapshot_file(rec.path, rec.meta)
+        except Exception as exc:
+            raise ClassifyError(f"unreadable snapshot: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ClassifyError("snapshot is not an object")
+        hashes = snapshot_unit_hashes(data)
+        digest = conversation_digest(hashes)
+        del data
+        self._remote_units[key] = hashes
+        self._remote_digest[key] = digest
+        cache_key = SemanticsCache.snapshot_key(
+            rec.project_identifier, rec.composer_id
+        )
+        self.cache.put_snapshot(cache_key, rec.identity, digest)
+        return hashes, digest
+
+    def remote_unit_hashes(self, rec: SnapshotRecord) -> list[str]:
+        units, digest = self.remote_semantics(rec)
+        if units is not None:
+            return units
+        units, _ = self._load_remote_from_file(rec)
+        return units
+
+    def ensure_remote_readable(self, rec: SnapshotRecord) -> None:
+        """Validate a snapshot-only candidate before treating it as behind.
+
+        A prior successful read (cache hit on source identity) is enough.
+        Meta digest alone is not: the file may have become unreadable.
+        """
+        if rec.invalid_origin:
+            raise ClassifyError("snapshot projectIdentifier does not match directory")
+        cache_key = SemanticsCache.snapshot_key(
+            rec.project_identifier, rec.composer_id
+        )
+        cached = self.cache.get_snapshot(cache_key, rec.identity)
+        if cached:
+            self._remote_digest[(rec.project_identifier, rec.composer_id)] = cached[
+                "semanticDigest"
+            ]
+            return
+        if self._sidecar_bound_to_body(rec):
+            self._remote_digest[(rec.project_identifier, rec.composer_id)] = rec.meta[
+                "semanticDigest"
+            ]
+            self.cache.put_snapshot(cache_key, rec.identity, rec.meta["semanticDigest"])
+            return
+        self._load_remote_from_file(rec)
+
+
+class SyncReadSession:
+    """One consistent read-only SQLite snapshot of the global Cursor DB."""
+
+    def __init__(self, global_db: Optional[Path] = None):
+        self._global_path = global_db if global_db is not None else paths.get_global_db_path()
+        self._cdb: Optional[db.CursorDB] = None
+        self._local_hashes: dict[str, list[str]] = {}
+        self._local_digest: dict[str, str] = {}
+        self._row_fp: dict[str, str] = {}
+        self._blob_ids: Optional[set[str]] = None
+        self._inventory_complete = False
+        self.cache = SemanticsCache()
+
+    def __enter__(self) -> "SyncReadSession":
+        if self._global_path.exists():
+            self._cdb = db.CursorDB(self._global_path)
+            self._cdb._ensure_read_copy()
+            _counts.sqlite_backups += 1
+            self._load_inventory()
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.cache.flush()
+        if self._cdb is not None:
+            self._cdb.close()
+            self._cdb = None
+
+    @property
+    def cdb(self) -> Optional[db.CursorDB]:
+        return self._cdb
+
+    def _load_inventory(self) -> None:
+        """Stream raw composer/bubble bytes into per-CID row fingerprints.
+
+        Does not deserialize JSON. Blob refs are discovered on the deep path
+        and reused from cache on subsequent warm runs.
+        """
+        if self._inventory_complete or self._cdb is None:
+            return
+        self._inventory_complete = False
+        self._row_fp = {}
+        hashers: dict[str, Any] = {}
+        try:
+            conn = self._cdb._ensure_read_copy()
+            for key, val in conn.execute(
+                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+            ):
+                cid = key.split(":", 1)[1]
+                raw = _as_bytes(val)
+                hasher = hashlib.sha256()
+                _hash_field(hasher, f"composerData:{cid}".encode("utf-8"), raw)
+                hashers[cid] = hasher
+
+            for key, val in conn.execute(
+                "SELECT key, value FROM cursorDiskKV "
+                "WHERE key LIKE 'bubbleId:%' ORDER BY key"
+            ):
+                parts = key.split(":", 2)
+                if len(parts) < 3:
+                    continue
+                cid, bid = parts[1], parts[2]
+                hasher = hashers.get(cid)
+                if hasher is None:
+                    continue
+                raw = _as_bytes(val)
+                _hash_field(hasher, f"bubbleId:{cid}:{bid}".encode("utf-8"), raw)
+
+            self._row_fp = {
+                cid: "sha256:" + hasher.hexdigest()
+                for cid, hasher in hashers.items()
+            }
+            self._inventory_complete = True
+        except Exception:
+            self._row_fp = {}
+            self._inventory_complete = False
+
+    def raw_fingerprint(self, composer_id: str) -> Optional[str]:
+        if not self._inventory_complete:
+            return None
+        return self._row_fp.get(composer_id)
+
+    def composer_data(self, composer_id: str) -> Optional[dict]:
+        if self._cdb is None:
+            return None
+        return self._cdb.get_json(f"composerData:{composer_id}")
+
+    def _available_blob_ids(self) -> set[str]:
+        if self._blob_ids is not None:
+            return self._blob_ids
+        if self._cdb is None:
+            self._blob_ids = set()
+            return self._blob_ids
+        prefix = "composer.content."
+        try:
+            self._blob_ids = {
+                key[len(prefix):] for key in self._cdb.list_keys(prefix)
+            }
+        except Exception:
+            self._blob_ids = set()
+        return self._blob_ids
+
+    def _hash_blob_refs(self, refs: list[str]) -> str:
+        hasher = hashlib.sha256()
+        for ref in refs:
+            val = None
+            if self._cdb is not None:
+                val = self._cdb.get_item_binary(
+                    f"composer.content.{ref}", table="cursorDiskKV"
+                )
+            _hash_field(
+                hasher,
+                ref.encode("utf-8"),
+                _as_bytes(val) if val is not None else b"\0missing",
+            )
+        return "sha256:" + hasher.hexdigest()
+
+    def cached_or_compute_digest(self, composer_id: str) -> Optional[str]:
+        """Reuse cached semantic digest when row + blob fingerprints match."""
+        if composer_id in self._local_digest:
+            return self._local_digest[composer_id]
+        if self._inventory_complete:
+            row_fp = self._row_fp.get(composer_id)
+            if row_fp is None:
+                return None
+            cached = self.cache.get_local(composer_id)
+            if cached and cached["rowFingerprint"] == row_fp:
+                blob_fp = self._hash_blob_refs(list(cached.get("blobRefs") or []))
+                if blob_fp == cached.get("blobFingerprint"):
+                    self._local_digest[composer_id] = cached["semanticDigest"]
+                    return cached["semanticDigest"]
+        hashes = self.local_unit_hashes(composer_id)
+        if hashes is None:
+            return None
+        return self._local_digest.get(composer_id)
+
+    def local_unit_hashes(self, composer_id: str) -> Optional[list[str]]:
+        if composer_id in self._local_hashes:
+            return self._local_hashes[composer_id]
+        data = self.composer_data(composer_id)
+        if not data or self._cdb is None:
+            return None
+        _counts.local_semantic_rehashes += 1
+        headers = _headers(data)
+        hashes: list[str] = []
+        available = self._available_blob_ids()
+        discovered: set[str] = set()
+        for header in headers:
+            bid = header.get("bubbleId")
+            if not bid:
+                raise ClassifyError("local header is missing bubbleId")
+            bubble = self._cdb.get_json(f"bubbleId:{composer_id}:{bid}")
+            if bubble is None:
+                cmap = data.get("conversationMap") or {}
+                bubble = cmap.get(bid) if isinstance(cmap, dict) else None
+            if bubble is None:
+                raise ClassifyError(f"referenced bubble is missing locally: {bid}")
+            blob_payload = (header, bubble)
+            blobs: dict[str, Any] = {}
+            for ref in _required_blob_ids(blob_payload, available):
+                val = self._cdb.get_disk_kv(f"composer.content.{ref}")
+                if val is None:
+                    raise ClassifyError(f"referenced blob missing locally: {ref}")
+                blobs[ref] = val
+                discovered.add(ref)
+            hashes.append(unit_hash(header, bubble, blobs))
+        self._local_hashes[composer_id] = hashes
+        digest = conversation_digest(hashes)
+        self._local_digest[composer_id] = digest
+        if self._inventory_complete:
+            row_fp = self._row_fp.get(composer_id)
+            if row_fp:
+                blob_refs = sorted(discovered)
+                self.cache.put_local(
+                    composer_id,
+                    row_fp,
+                    blob_refs,
+                    self._hash_blob_refs(blob_refs),
+                    digest,
+                )
+        return hashes
+
+    def local_digest(self, composer_id: str) -> Optional[str]:
+        return self.cached_or_compute_digest(composer_id)
+
+    def export_conversation(
+        self,
+        project_path: str,
+        composer_id: str,
+        source_host: Optional[str] = None,
+    ) -> Optional[dict]:
+        if self._cdb is None:
+            return None
+        _counts.full_local_exports += 1
+        return export.export_conversation(
+            project_path,
+            composer_id,
+            _cdb=self._cdb,
+            source_host=source_host,
+        )
+
+
+@dataclass
+class PlannedItem:
+    composer_id: str
+    relation: SyncRelation
+    name: str = ""
+    snapshot_path: Optional[Path] = None
+    meta: dict = field(default_factory=dict)
+    workspace_dir: Optional[Path] = None
+    project_path: str = ""
+    source_host: Optional[str] = None
+    project_identifier: str = ""
+
+
+@dataclass
+class SyncPlan:
+    items: list[PlannedItem] = field(default_factory=list)
+
+    def by_relation(self, relation: SyncRelation) -> list[PlannedItem]:
+        return [i for i in self.items if i.relation == relation]
+
+    @property
+    def diverged(self) -> list[PlannedItem]:
+        return self.by_relation(SyncRelation.DIVERGED)
+
+    @property
+    def unknown(self) -> list[PlannedItem]:
+        return self.by_relation(SyncRelation.UNKNOWN)
+
+    @property
+    def behind(self) -> list[PlannedItem]:
+        return self.by_relation(SyncRelation.BEHIND)
+
+    @property
+    def ahead(self) -> list[PlannedItem]:
+        return self.by_relation(SyncRelation.LOCAL_AHEAD)
+
+    @property
+    def unsafe(self) -> bool:
+        return bool(self.diverged or self.unknown)
+
+
+def _planned_name(
+    session: SyncReadSession,
+    rec: Optional[SnapshotRecord],
+    composer_id: str,
+    relation: SyncRelation,
+) -> str:
+    if rec is not None:
+        meta_name = rec.meta.get("name")
+        if meta_name:
+            return meta_name
+    if relation in (SyncRelation.DIVERGED, SyncRelation.UNKNOWN):
+        data = session.composer_data(composer_id) or {}
+        return data.get("name") or "Untitled"
+    return "Untitled"
+
+
+def classify_pair(
+    local_hashes: Optional[list[str]],
+    remote_hashes: Optional[list[str]],
+    *,
+    has_snapshot: bool,
+) -> SyncRelation:
+    if not has_snapshot:
+        return SyncRelation.NEVER_PUSHED if local_hashes is not None else SyncRelation.UNKNOWN
+    if local_hashes is None:
+        return SyncRelation.BEHIND
+    if remote_hashes is None:
+        return SyncRelation.UNKNOWN
+    return compare_unit_hashes(local_hashes, remote_hashes)
+
+
+def classify_conversation(
+    session: SyncReadSession,
+    index: SnapshotIndex,
+    composer_id: str,
+    *,
+    project_identifier: Optional[str] = None,
+    source_host: Optional[str] = None,
+    source_path: Optional[str] = None,
+    workspace: Optional[dict] = None,
+) -> SyncRelation:
+    if workspace is not None:
+        if project_identifier is None:
+            project_identifier = paths.get_workspace_project_identifier(workspace)
+        if source_host is None:
+            source_host = workspace.get("host")
+        if source_path is None:
+            source_path = workspace.get("path")
+
+    rec = index.get(
+        composer_id,
+        project_identifier,
+        source_host=source_host,
+        source_path=source_path,
+    )
+    if rec is None:
+        return SyncRelation.NEVER_PUSHED
+    if rec.invalid_origin:
+        return SyncRelation.UNKNOWN
+
+    session.cache = index.cache
+    try:
+        local_digest = session.cached_or_compute_digest(composer_id)
+    except ClassifyError:
+        return SyncRelation.UNKNOWN
+
+    try:
+        remote_units, remote_digest = index.remote_semantics(rec)
+    except ClassifyError:
+        return SyncRelation.UNKNOWN
+
+    if local_digest and remote_digest and local_digest == remote_digest:
+        return SyncRelation.UP_TO_DATE
+
+    try:
+        local_hashes = session.local_unit_hashes(composer_id)
+        if remote_units is None:
+            remote_units = index.remote_unit_hashes(rec)
+    except ClassifyError:
+        return SyncRelation.UNKNOWN
+    relation = classify_pair(local_hashes, remote_units, has_snapshot=True)
+    index._remote_units.pop((rec.project_identifier, rec.composer_id), None)
+    return relation
+
+
+def classify_snapshot_vs_local(
+    session: SyncReadSession,
+    index: SnapshotIndex,
+    composer_id: str,
+    *,
+    project_identifier: Optional[str] = None,
+) -> str:
+    rec = index.get(composer_id, project_identifier) if project_identifier else None
+    if rec is None and project_identifier:
+        return NOT_LOCAL
+    if rec is None:
+        return NOT_LOCAL
+    try:
+        local_digest = session.cached_or_compute_digest(composer_id)
+    except ClassifyError:
+        return SyncRelation.UNKNOWN.value
+    if local_digest is None and session.composer_data(composer_id) is None:
+        return NOT_LOCAL
+    relation = classify_conversation(
+        session, index, composer_id, project_identifier=rec.project_identifier
+    )
+    return relation.value
+
+
+def build_sync_plan(
+    session: SyncReadSession,
+    index: SnapshotIndex,
+    workspaces: Optional[list[dict]] = None,
+) -> SyncPlan:
+    """Classify every local conversation and every snapshot. Read-only."""
+    plan = SyncPlan()
+    seen: set[tuple[str, str]] = set()
+    session.cache = index.cache
+
+    if workspaces is None:
+        workspaces = paths.list_workspaces_with_conversations()
+
+    for ws in workspaces:
+        ws_dir = ws["workspace_dir"]
+        db_path = ws_dir / "state.vscdb"
+        if not db_path.exists():
+            continue
+        project_id = paths.get_workspace_project_identifier(ws)
+        composer_ids = paths.get_workspace_composer_ids(db_path)
+        for cid in composer_ids:
+            key = (project_id, cid)
+            if key in seen:
+                continue
+            seen.add(key)
+            rec = index.get(
+                cid,
+                project_id,
+                source_host=ws.get("host"),
+                source_path=ws.get("path"),
+            )
+            try:
+                relation = classify_conversation(
+                    session, index, cid, workspace=ws, project_identifier=project_id
+                )
+            except ClassifyError:
+                relation = SyncRelation.UNKNOWN
+            plan.items.append(
+                PlannedItem(
+                    composer_id=cid,
+                    relation=relation,
+                    name=_planned_name(session, rec, cid, relation),
+                    snapshot_path=rec.path if rec else None,
+                    meta=rec.meta if rec else {},
+                    workspace_dir=ws_dir,
+                    project_path=ws.get("path") or "",
+                    source_host=ws.get("host"),
+                    project_identifier=project_id,
+                )
+            )
+
+    for rec in index.by_key.values():
+        key = (rec.project_identifier, rec.composer_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        # No local workspace registered this CID for this origin. Do not
+        # consult the global composer: it may belong to another project.
+        if rec.invalid_origin:
+            relation = SyncRelation.UNKNOWN
+        else:
+            try:
+                index.ensure_remote_readable(rec)
+            except ClassifyError:
+                relation = SyncRelation.UNKNOWN
+            else:
+                relation = SyncRelation.BEHIND
+        plan.items.append(
+            PlannedItem(
+                composer_id=rec.composer_id,
+                relation=relation,
+                name=rec.meta.get("name") or "Untitled",
+                snapshot_path=rec.path,
+                meta=rec.meta,
+                project_identifier=rec.project_identifier,
+                source_host=rec.meta.get("sourceHost"),
+                project_path=rec.meta.get("sourceProjectPath") or "",
+            )
+        )
+    index.cache.flush()
+    session.cache.flush()
+    return plan

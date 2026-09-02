@@ -474,7 +474,9 @@ def export_conversation(
             "exportedAt": datetime.now(timezone.utc).isoformat(),
             "sourceMachine": paths.get_machine_id(),
             "sourceHost": source_host,
-            "sourceProjectPath": os.path.normpath(project_path),
+            "sourceProjectPath": paths.normalize_origin_path(
+                project_path, source_host=source_host
+            ),
             "projectIdentifier": paths.get_project_identifier(
                 project_path, source_host=source_host
             ),
@@ -592,6 +594,15 @@ def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
         "version": snapshot.get("version"),
         "shardCount": num_shards if num_shards else None,
     }
+    try:
+        from . import syncstate
+        meta["semanticDigest"] = syncstate.snapshot_semantic_digest(snapshot)
+        meta["semanticDigestVersion"] = syncstate.SEMANTIC_DIGEST_VERSION
+        meta["snapshotContentDigest"] = syncstate.snapshot_content_digest(
+            snapshot_file, meta
+        )
+    except Exception:
+        pass
     meta_file = project_dir / f"{composer_id}.meta.json"
     meta_file.write_text(json.dumps(meta, indent=2))
 

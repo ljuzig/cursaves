@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, db, dblock, export, paths
+from . import __version__, db, dblock, export, paths, syncstate
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
     copy_between_workspaces,
@@ -62,8 +62,6 @@ def _delete_snapshot_unlocked(path: Path):
         meta.unlink()
 from .reload import print_reload_hint
 from .watch import watch_loop
-
-
 
 def _ensure_synced() -> None:
     """Pull latest from remote to ensure we have the latest state."""
@@ -152,9 +150,22 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
 
     project_id = paths.get_workspace_project_identifier(ws)
 
-    counts = {"up_to_date": 0, "local_ahead": 0, "behind": 0, "never_pushed": 0}
+    counts = {
+        "up_to_date": 0,
+        "local_ahead": 0,
+        "behind": 0,
+        "never_pushed": 0,
+        "diverged": 0,
+        "unknown": 0,
+    }
+    session = getattr(_workspace_sync_summary, "_session", None)
+    index = getattr(_workspace_sync_summary, "_index", None)
     for cid in composer_ids:
-        status = get_push_status_for_conversation(cid, project_id, _cdb=_global_cdb)
+        status = get_push_status_for_conversation(
+            cid, project_id, _cdb=_global_cdb, session=session, index=index,
+            source_host=ws.get("host"),
+            source_path=ws.get("path"),
+        )
         counts[status] = counts.get(status, 0) + 1
 
     parts = []
@@ -166,6 +177,10 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
         parts.append(f"{counts['behind']} behind")
     if counts["never_pushed"]:
         parts.append(f"{counts['never_pushed']} not pushed")
+    if counts["diverged"]:
+        parts.append(f"{counts['diverged']} diverged")
+    if counts["unknown"]:
+        parts.append(f"{counts['unknown']} unknown")
 
     return ", ".join(parts) if parts else ""
 
@@ -180,22 +195,28 @@ def cmd_workspaces(args):
     print(f"{'#':<4} {'Type':<10} {'Path':<38} {'Host':<12} {'Chats':>5}  {'Hash':<9}  {'Sync Status'}")
     print("-" * 115)
 
-    global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
+    session = None
     try:
+        session = syncstate.SyncReadSession()
+        session.__enter__()
+        index = syncstate.SnapshotIndex.build()
+        _workspace_sync_summary._session = session
+        _workspace_sync_summary._index = index
         for i, ws in enumerate(workspaces, 1):
             path = ws["path"]
             if len(path) > 36:
                 path = "..." + path[-33:]
             host = ws["host"] or ""
             convos = ws.get("conversations", 0)
-            sync = _workspace_sync_summary(ws, _global_cdb=global_cdb)
+            sync = _workspace_sync_summary(ws, _global_cdb=session.cdb)
             ws_hash = ws["workspace_dir"].name[:8]
 
             print(f"{i:<4} {ws['type']:<10} {path:<38} {host:<12} {convos:>5}  {ws_hash}  {sync}")
     finally:
-        if global_cdb:
-            global_cdb.close()
+        _workspace_sync_summary._session = None
+        _workspace_sync_summary._index = None
+        if session is not None:
+            session.__exit__(None, None, None)
 
     print(f"\n{len(workspaces)} workspace(s) with conversations")
     print("\nUse 'cursaves push -w <number or hash>' to push a specific workspace.")
@@ -227,9 +248,11 @@ def cmd_snapshots(args):
         print("Run 'cursaves push' to checkpoint and push conversations.")
         return
 
-    global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
+    session = None
     try:
+        session = syncstate.SyncReadSession()
+        session.__enter__()
+        index = syncstate.SnapshotIndex.build()
         for i, p in enumerate(projects, 1):
             name = p["name"]
             hosts = ", ".join(sorted(p.get("source_hosts") or []))
@@ -248,7 +271,10 @@ def cmd_snapshots(args):
                 source = source_host or meta.get("sourceMachine") or "unknown"
                 cid = meta.get("composerId")
                 if cid:
-                    status = get_sync_status_for_snapshot(cid, msgs, _cdb=global_cdb)
+                    status = get_sync_status_for_snapshot(
+                        cid, msgs, session=session, index=index,
+                        project_identifier=p["path"].name,
+                    )
                     status_label = f"[{format_sync_status(status)}]"
                 else:
                     status_label = ""
@@ -257,8 +283,8 @@ def cmd_snapshots(args):
                     chat_name = chat_name[:33] + "..."
                 print(f"    {chat_name:<38} {msgs:>5} msgs  from {source:<16} {status_label}")
     finally:
-        if global_cdb:
-            global_cdb.close()
+        if session is not None:
+            session.__exit__(None, None, None)
 
     print(f"\n{len(projects)} project(s) with snapshots")
     print(f"\nUse 'cursaves pull -s' to interactively select which to import.")
@@ -657,7 +683,8 @@ def _find_ahead_conversations() -> list[dict]:
     if not global_db_path.exists():
         return ahead_items
 
-    with db.CursorDB(global_db_path) as global_cdb:
+    with syncstate.SyncReadSession() as session:
+        index = syncstate.SnapshotIndex.build()
         for ws in workspaces:
             ws_dir = ws["workspace_dir"]
             db_path = ws_dir / "state.vscdb"
@@ -671,10 +698,13 @@ def _find_ahead_conversations() -> list[dict]:
             project_id = paths.get_workspace_project_identifier(ws)
 
             for cid in composer_ids:
-                status = get_push_status_for_conversation(cid, project_id, _cdb=global_cdb)
+                status = get_push_status_for_conversation(
+                    cid, project_id, session=session, index=index,
+                    source_host=ws.get("host"),
+                    source_path=ws.get("path"),
+                )
                 if status == "local_ahead":
-                    # Get chat name from global DB
-                    cd = global_cdb.get_json(f"composerData:{cid}")
+                    cd = session.composer_data(cid)
                     name = cd.get("name", "Untitled") if cd else "Untitled"
 
                     ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
@@ -734,15 +764,48 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
     return total_saved
 
 
-def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBackend] = None) -> int:
+def _push_ahead_from_plan(
+    plan: syncstate.SyncPlan,
+    session: syncstate.SyncReadSession,
+    backend: SyncBackend,
+) -> int:
+    """Save ahead conversations from the preflight SQLite copies, then push."""
+    if plan.unsafe:
+        return 0
+    snapshots_dir = paths.get_snapshots_dir()
+    saved = 0
+    for item in plan.ahead:
+        snapshot = session.export_conversation(
+            item.project_path,
+            item.composer_id,
+            source_host=item.source_host,
+        )
+        if not snapshot:
+            continue
+        export.save_snapshot(snapshot, snapshots_dir)
+        saved += 1
+    if saved == 0:
+        return 0
+    if backend.has_remote():
+        print("  Pushing...", end="", flush=True)
+        if backend.push(snapshots_dir):
+            print(" done")
+        else:
+            print(" failed", file=sys.stderr)
+    return saved
+
+
+def _push_ahead(
+    sync_dir: Path,
+    auto: bool = False,
+    backend: Optional[SyncBackend] = None,
+    plan: Optional[syncstate.SyncPlan] = None,
+    session: Optional[syncstate.SyncReadSession] = None,
+) -> int:
     """Find conversations ahead of snapshots and push them.
 
-    Args:
-        sync_dir: The sync repo directory.
-        auto: If True, skip prompts and push all ahead conversations.
-        backend: Sync backend to use for push. Auto-detected if None.
-
-    Returns the number of conversations pushed.
+    When *plan* and *session* are provided (``cmd_sync``), exports use the
+    preflight SQLite copies instead of re-reading a live Cursor DB.
     """
     db.finish_cursor_writes()
 
@@ -757,6 +820,9 @@ def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBacken
                 print(" done")
             else:
                 print(" failed (continuing with local state)", file=sys.stderr)
+
+    if plan is not None and session is not None:
+        return _push_ahead_from_plan(plan, session, backend)
 
     ahead_items = _find_ahead_conversations()
 
@@ -838,93 +904,47 @@ def _save_sync_state(state: dict):
     state_path.write_text(json.dumps(state, indent=2))
 
 
-def _pull_behind(sync_dir: Path) -> int:
-    """Find all snapshots where local is behind and import them automatically.
+def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> int:
+    """Import conversations the preflight plan classified as behind.
 
-    For each behind/new snapshot, finds workspaces that already have the
-    conversation registered and imports only into those.  This prevents
-    duplicating imports across every matching workspace.
-
-    Returns the number of snapshots successfully imported.
+    When *plan* is omitted a read-only plan is built first. Diverged or
+    unknown items are never imported here; ``cmd_sync`` aborts first.
     """
-    projects = list_snapshot_projects()
-    if not projects:
+    if plan is None:
+        with syncstate.SyncReadSession() as session:
+            index = syncstate.SnapshotIndex.build()
+            plan = syncstate.build_sync_plan(session, index)
+    if plan.unsafe:
         return 0
 
     global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
-
-    sync_state = _load_sync_state()
-    handled = sync_state.get("handled_diverged", {})
-
     total_imported = 0
     backed_up_global = False
     backed_up_ws: set[str] = set()
 
-    try:
-        for project in projects:
-            snapshot_files = list_snapshot_files(project["path"])
-            if not snapshot_files:
-                continue
-
-            behind_snapshots: list[tuple[Path, dict]] = []
-            for sf in snapshot_files:
-                meta = read_snapshot_meta(sf)
-                cid = meta.get("composerId")
-                if not cid:
-                    continue
-
-                # Skip snapshots we've already handled as diverged
-                msg_count = meta.get("messageCount", 0)
-                prev_handled = handled.get(cid)
-                if prev_handled and prev_handled >= msg_count:
-                    continue
-
-                status = get_sync_status_for_snapshot(cid, msg_count, _cdb=global_cdb)
-                if status in ("behind", "not_local"):
-                    behind_snapshots.append((sf, meta))
-
-            if not behind_snapshots:
-                continue
-
-            for sf, meta in behind_snapshots:
-                cid = meta.get("composerId", "")
-                target_list = resolve_sync_import_targets(meta)
-
-                if not target_list:
-                    continue
-
-                for ws in target_list:
-                    if not backed_up_global and global_db_path.exists():
-                        db.backup_db(global_db_path)
-                        backed_up_global = True
-
-                    ws_dir_str = str(ws["workspace_dir"])
-                    if ws_dir_str not in backed_up_ws:
-                        ws_db_path = ws["workspace_dir"] / "state.vscdb"
-                        if ws_db_path.exists():
-                            db.backup_db(ws_db_path)
-                        backed_up_ws.add(ws_dir_str)
-
-                    ok = import_snapshot(
-                        sf, ws["path"],
-                        target_workspace_dir=ws["workspace_dir"],
-                        skip_backup=True,
-                    )
-                    if ok:
-                        total_imported += 1
-
-                # Record that we've handled this snapshot at this message count
-                # so diverged conversations don't get re-imported every sync
-                msg_count = meta.get("messageCount", 0)
-                handled[cid] = msg_count
-    finally:
-        if global_cdb:
-            global_cdb.close()
-
-    # Persist sync state so handled diverged snapshots are remembered
-    sync_state["handled_diverged"] = handled
-    _save_sync_state(sync_state)
+    for item in plan.behind:
+        if item.snapshot_path is None:
+            continue
+        target_list = resolve_sync_import_targets(item.meta)
+        if not target_list:
+            continue
+        for ws in target_list:
+            if not backed_up_global and global_db_path.exists():
+                db.backup_db(global_db_path)
+                backed_up_global = True
+            ws_dir_str = str(ws["workspace_dir"])
+            if ws_dir_str not in backed_up_ws:
+                ws_db_path = ws["workspace_dir"] / "state.vscdb"
+                if ws_db_path.exists():
+                    db.backup_db(ws_db_path)
+                backed_up_ws.add(ws_dir_str)
+            ok = import_snapshot(
+                item.snapshot_path, ws["path"],
+                target_workspace_dir=ws["workspace_dir"],
+                skip_backup=True,
+            )
+            if ok:
+                total_imported += 1
 
     return total_imported
 
@@ -942,6 +962,30 @@ def cmd_repair(args):
         print("using the latest cursaves (which exports agent blobs).")
 
 
+def _print_sync_abort(plan: syncstate.SyncPlan) -> None:
+    diverged = plan.diverged
+    unknown = plan.unknown
+    if diverged:
+        print("Sync aborted: divergent conversations detected.\n", file=sys.stderr)
+        for item in diverged:
+            print(f"  {item.composer_id[:12]}  {item.name}", file=sys.stderr)
+        print(
+            "\nLocal and snapshot histories are no longer append-only.\n"
+            "Sync stopped before importing into Cursor or creating/pushing snapshots.",
+            file=sys.stderr,
+        )
+    if unknown:
+        if diverged:
+            print(file=sys.stderr)
+        print("Sync aborted: conversations could not be classified.\n", file=sys.stderr)
+        for item in unknown:
+            print(f"  {item.composer_id[:12]}  {item.name}", file=sys.stderr)
+        print(
+            "\nSync stopped before importing into Cursor or creating/pushing snapshots.",
+            file=sys.stderr,
+        )
+
+
 def cmd_sync(args):
     """Pull behind conversations then push ahead ones — fully automatic."""
     sync_dir = _require_sync_repo()
@@ -957,38 +1001,60 @@ def cmd_sync(args):
             print(" failed", file=sys.stderr)
             return
 
-    # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
-    print("\n── Pull ──")
-    imported = _pull_behind(sync_dir)
-    if imported > 0:
-        print(f"  Imported {imported} conversation(s)")
-    else:
-        print("  Everything up to date")
+    # Step 2: Read-only preflight. --force does not override divergence.
+    # No snapshots means every local chat is never_pushed: skip the Cursor
+    # DB snapshot and workspace walk (nothing can be behind/ahead/diverged).
+    index = syncstate.SnapshotIndex.build()
+    session = syncstate.SyncReadSession()
+    session_entered = False
+    try:
+        if index.by_key:
+            session.cache = index.cache
+            session.__enter__()
+            session_entered = True
+            plan = syncstate.build_sync_plan(session, index)
+        else:
+            plan = syncstate.SyncPlan()
+        if plan.unsafe:
+            _print_sync_abort(plan)
+            sys.exit(1)
 
-    # Cursor writes from the import phase are committed and connections
-    # closed. Drop the process-wide sqlite write lock before snapshot/Git
-    # so we never acquire repo.lock while holding sqlite (deadlock).
-    db.finish_cursor_writes()
-
-    # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
-    print("\n── Push ──")
-    pushed = _push_ahead(sync_dir, auto=True, backend=backend)
-    if pushed == 0:
-        print("  Nothing to push")
-
-    # Summary
-    print()
-    if imported > 0 or pushed > 0:
-        parts = []
+        # Step 3: Import — only conversations classified as behind
+        print("\n── Pull ──")
+        imported = _pull_behind(sync_dir, plan=plan)
         if imported > 0:
-            parts.append(f"{imported} pulled")
-        if pushed > 0:
-            parts.append(f"{pushed} pushed")
-        print(f"Sync complete: {', '.join(parts)}.")
-        if imported > 0:
-            print("Restart Cursor to see imported chats.")
-    else:
-        print("Already in sync.")
+            print(f"  Imported {imported} conversation(s)")
+        else:
+            print("  Everything up to date")
+
+        # Cursor writes from the import phase are committed and connections
+        # closed. Drop the process-wide sqlite write lock before snapshot/Git
+        # so we never acquire repo.lock while holding sqlite (deadlock).
+        db.finish_cursor_writes()
+
+        # Step 4: Push — export ahead conversations from preflight copies
+        print("\n── Push ──")
+        pushed = _push_ahead(
+            sync_dir, auto=True, backend=backend, plan=plan, session=session
+        )
+        if pushed == 0:
+            print("  Nothing to push")
+
+        print()
+        if imported > 0 or pushed > 0:
+            parts = []
+            if imported > 0:
+                parts.append(f"{imported} pulled")
+            if pushed > 0:
+                parts.append(f"{pushed} pushed")
+            print(f"Sync complete: {', '.join(parts)}.")
+            if imported > 0:
+                print("Restart Cursor to see imported chats.")
+        else:
+            print("Already in sync.")
+    finally:
+        if session_entered:
+            session.__exit__(None, None, None)
 
 
 def cmd_push(args):
@@ -1337,6 +1403,20 @@ def cmd_status(args):
     only_snapshot = snapshot_ids - local_ids
     in_both = local_ids & snapshot_ids
 
+    diverged = 0
+    unknown = 0
+    if in_both:
+        with syncstate.SyncReadSession() as session:
+            index = syncstate.SnapshotIndex.build()
+            for cid in in_both:
+                rel = syncstate.classify_conversation(
+                    session, index, cid, project_identifier=project_id
+                )
+                if rel == syncstate.SyncRelation.DIVERGED:
+                    diverged += 1
+                elif rel == syncstate.SyncRelation.UNKNOWN:
+                    unknown += 1
+
     print(f"Project: {project_path}")
     print(f"Identity: {project_id}")
     print(f"Snapshots: {snapshots_dir}\n")
@@ -1345,6 +1425,10 @@ def cmd_status(args):
     print(f"  In both:                 {len(in_both)}")
     print(f"  Local only (unexported): {len(only_local)}")
     print(f"  Snapshot only (not imported): {len(only_snapshot)}")
+    if diverged:
+        print(f"  Diverged:                 {diverged}")
+    if unknown:
+        print(f"  Unknown:                  {unknown}")
 
     if only_local:
         print(f"\nLocal only (run 'checkpoint' to export):")
@@ -1865,6 +1949,10 @@ def main():
     # ── sync ──────────────────────────────────────────────────────
     p_sync = subparsers.add_parser(
         "sync", help="Pull behind + push ahead — one command to stay in sync across machines"
+    )
+    p_sync.add_argument(
+        "--force", action="store_true",
+        help="Suppress the Cursor-running warning (does not override a divergence)",
     )
     p_sync.set_defaults(func=cmd_sync)
 
