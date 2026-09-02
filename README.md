@@ -85,12 +85,15 @@ For SSH remote projects (or custom workspaces), Cursor stores chats on your loca
 # See all workspaces (local, SSH remote, custom .code-workspace)
 cursaves workspaces
 
-# Push/pull a specific workspace by number, hash, or path substring
+# Then target one by number, hash, or path substring
 cursaves push -w 3
+cursaves pull -w 3
+cursaves sync -w 3
 cursaves push -w 497e8ab0   # by hash (from the Hash column)
+cursaves sync -w 497e8ab0
 ```
 
-`push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports only conversations that are missing locally or behind the snapshot. Already-synced and local-ahead chats are left alone, with no Cursor writes. `cursaves pull --restore-all` re-imports every valid snapshot of that exact origin. `sync` does both automatically — pulling conversations where your local copy is behind, and pushing ones where your local copy is ahead. After importing, restart Cursor (quit and reopen) to see the conversations.
+`push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports only conversations that are missing locally or behind the snapshot. Already-synced and local-ahead chats are left alone, with no Cursor writes. `cursaves pull --restore-all` re-imports every valid snapshot of that exact origin. `sync` does both automatically — pulling conversations where your local copy is behind, and pushing ones where your local copy is ahead. `sync -w` classifies and writes only that workspace; a divergence in another workspace does not abort it. After importing, restart Cursor (quit and reopen) to see the conversations.
 
 For Remote SSH workspaces, always pass `-w` so the host is part of the project identity. `pull -p` / a bare path will not auto-import SSH snapshots.
 
@@ -371,6 +374,14 @@ cursaves workspaces               # List workspaces; note the #, Hash, or path
 cursaves pull -w 3                # By number — uses that host's identity
 cursaves pull -w 497e8ab0         # By hash
 cursaves pull -w 3 --restore-all  # re-import every valid snapshot of that origin
+```
+
+**Syncing one SSH workspace:**
+
+```bash
+cursaves workspaces
+cursaves sync -w 3           # pull behind + push ahead for that workspace only
+cursaves sync -w 497e8ab0
 ```
 
 `pull -p /some/path` (no `-w`) never auto-resolves a snapshot bucket that contains Remote SSH chats. Use `-w` or `pull -s`.
