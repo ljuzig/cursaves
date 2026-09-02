@@ -219,7 +219,8 @@ def cmd_workspaces(args):
             session.__exit__(None, None, None)
 
     print(f"\n{len(workspaces)} workspace(s) with conversations")
-    print("\nUse 'cursaves push -w <number or hash>' to push a specific workspace.")
+    print("\nUse 'cursaves push -w <number or hash>' or 'cursaves sync -w <number or hash>'")
+    print("to target a specific workspace.")
 
 
 def _is_remote_path(path: str, source_machine: str) -> bool:
@@ -774,7 +775,12 @@ def _push_ahead_from_plan(
         return 0
     snapshots_dir = paths.get_snapshots_dir()
     saved = 0
+    target_dir = None
+    if plan.target_workspace is not None:
+        target_dir = plan.target_workspace.get("workspace_dir")
     for item in plan.ahead:
+        if target_dir is not None and item.workspace_dir != target_dir:
+            continue
         snapshot = session.export_conversation(
             item.project_path,
             item.composer_id,
@@ -925,7 +931,14 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
     for item in plan.behind:
         if item.snapshot_path is None:
             continue
-        target_list = resolve_sync_import_targets(item.meta)
+        if plan.target_workspace is not None:
+            target_ws = plan.target_workspace
+            item_dir = item.workspace_dir
+            if item_dir is not None and item_dir != target_ws.get("workspace_dir"):
+                continue
+            target_list = [target_ws]
+        else:
+            target_list = resolve_sync_import_targets(item.meta)
         if not target_list:
             continue
         for ws in target_list:
@@ -986,6 +999,19 @@ def _print_sync_abort(plan: syncstate.SyncPlan) -> None:
         )
 
 
+def _sync_target_workspace(args) -> Optional[dict]:
+    """Exact workspace for ``sync -w``, or None for the global plan."""
+    if not getattr(args, "workspace", None):
+        return None
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
+    return {
+        "path": project_path,
+        "workspace_dir": workspace_dir,
+        "host": source_host,
+        "type": "ssh" if source_host else "local",
+    }
+
+
 def cmd_sync(args):
     """Pull behind conversations then push ahead ones — fully automatic."""
     sync_dir = _require_sync_repo()
@@ -1004,7 +1030,14 @@ def cmd_sync(args):
     # Step 2: Read-only preflight. --force does not override divergence.
     # No snapshots means every local chat is never_pushed: skip the Cursor
     # DB snapshot and workspace walk (nothing can be behind/ahead/diverged).
-    index = syncstate.SnapshotIndex.build()
+    # ``sync -w`` classifies only that workspace's exact origin.
+    target_workspace = _sync_target_workspace(args)
+    if target_workspace is not None:
+        index = pull.scoped_snapshot_index(
+            target_workspace["path"], target_workspace.get("host")
+        )
+    else:
+        index = syncstate.SnapshotIndex.build()
     session = syncstate.SyncReadSession()
     session_entered = False
     try:
@@ -1012,9 +1045,11 @@ def cmd_sync(args):
             session.cache = index.cache
             session.__enter__()
             session_entered = True
-            plan = syncstate.build_sync_plan(session, index)
+            plan = syncstate.build_sync_plan(
+                session, index, target_workspace=target_workspace
+            )
         else:
-            plan = syncstate.SyncPlan()
+            plan = syncstate.SyncPlan(target_workspace=target_workspace)
         if plan.unsafe:
             _print_sync_abort(plan)
             sys.exit(1)
@@ -1933,6 +1968,10 @@ def main():
         "sync", help="Pull behind + push ahead — one command to stay in sync across machines"
     )
     p_sync.add_argument(
+        "--workspace", "-w",
+        help="Sync only this workspace (number, hash, or path substring from 'cursaves workspaces')",
+    )
+    p_sync.add_argument(
         "--force", action="store_true",
         help="Suppress the Cursor-running warning (does not override a divergence)",
     )
@@ -2061,6 +2100,8 @@ def main():
             "  push -s               Select workspace + chats to push\n"
             "  pull                  Pull + import chats\n"
             "  pull -s               Select which snapshots to import\n"
+            "  sync                  Pull behind + push ahead\n"
+            "  sync -w <ws>          Same, one workspace only\n"
             "\n"
             "─── Copy between workspaces (same machine) ─────────────────────\n"
             "\n"
