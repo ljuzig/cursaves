@@ -13,11 +13,18 @@ from typing import Optional
 from . import export, paths
 
 
-def _get_db_fingerprint(project_path: str) -> Optional[str]:
+def _get_db_fingerprint(
+    project_path: str,
+    workspace_dir: Optional[Path] = None,
+) -> Optional[str]:
     """Get a fingerprint of the current conversation state.
 
     Uses the modification time + size of the workspace and global DBs
     as a cheap change-detection signal.
+
+    When workspace_dir is provided, only that workspace DB is checked.
+    Path-only lookup would pick the newest workspace with the same remote
+    path and lose the SSH host.
     """
     parts = []
 
@@ -33,8 +40,11 @@ def _get_db_fingerprint(project_path: str) -> Optional[str]:
             parts.append(f"wal:{wst.st_mtime}:{wst.st_size}")
 
     # Workspace DB mtime + size
-    ws_dirs = paths.find_workspace_dirs_for_project(project_path)
-    for ws_dir in ws_dirs[:1]:  # Just check the most recent
+    if workspace_dir is not None:
+        ws_dirs = [workspace_dir]
+    else:
+        ws_dirs = paths.find_workspace_dirs_for_project(project_path)
+    for ws_dir in ws_dirs[:1]:
         ws_db = ws_dir / "state.vscdb"
         if ws_db.exists():
             st = ws_db.stat()
@@ -157,8 +167,23 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         return False, f"git error: {e}"
 
 
+def checkpoint_watched_project(
+    project_path: str,
+    workspace_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
+) -> list:
+    """Checkpoint the watched workspace, preserving SSH host identity."""
+    return export.checkpoint_project(
+        project_path,
+        workspace_dir=workspace_dir,
+        source_host=source_host,
+    )
+
+
 def watch_loop(
     project_path: str,
+    workspace_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
     interval: int = 60,
     git_sync: bool = True,
     verbose: bool = False,
@@ -167,12 +192,16 @@ def watch_loop(
 
     Args:
         project_path: The project to watch.
+        workspace_dir: Specific Cursor workspace directory (-w).
+        source_host: SSH host for Remote SSH workspaces (-w).
         interval: Seconds between checks.
         git_sync: Whether to auto-commit and push to git.
         verbose: Print status messages on every check.
     """
     print(f"cursaves watch started")
     print(f"  Project: {project_path}")
+    if source_host:
+        print(f"  SSH host: {source_host}")
     print(f"  Interval: {interval}s")
     print(f"  Git sync: {'enabled' if git_sync else 'disabled'}")
     print(f"  Machine: {paths.get_machine_id()}")
@@ -185,7 +214,7 @@ def watch_loop(
         print("Warning: snapshots directory is not in a git repo. Git sync disabled.")
         git_sync = False
 
-    last_fingerprint = _get_db_fingerprint(project_path)
+    last_fingerprint = _get_db_fingerprint(project_path, workspace_dir=workspace_dir)
     checkpoint_count = 0
 
     # Handle graceful shutdown
@@ -205,7 +234,9 @@ def watch_loop(
         if not running:
             break
 
-        current_fingerprint = _get_db_fingerprint(project_path)
+        current_fingerprint = _get_db_fingerprint(
+            project_path, workspace_dir=workspace_dir
+        )
 
         if current_fingerprint == last_fingerprint:
             if verbose:
@@ -215,7 +246,11 @@ def watch_loop(
         # Change detected -- checkpoint
         print(f"[{_now()}] change detected, checkpointing...")
         try:
-            saved = export.checkpoint_project(project_path)
+            saved = checkpoint_watched_project(
+                project_path,
+                workspace_dir=workspace_dir,
+                source_host=source_host,
+            )
             if saved:
                 checkpoint_count += 1
                 print(f"[{_now()}] checkpointed {len(saved)} conversation(s) (total: {checkpoint_count})")

@@ -97,6 +97,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
             "messageCount": 0,
             "exportedAt": None,
             "sourceMachine": None,
+            "sourceHost": None,
             "sourceProjectPath": None,
         }
 
@@ -590,6 +591,7 @@ def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
 
         source_paths = set()
         source_machines = set()
+        source_hosts = set()
         latest_export = None
         for sf in snapshot_files:
             meta = read_snapshot_meta(sf)
@@ -599,6 +601,9 @@ def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
             sm = meta.get("sourceMachine", "")
             if sm:
                 source_machines.add(sm)
+            sh = meta.get("sourceHost") or ""
+            if sh:
+                source_hosts.add(sh)
             exported_at = meta.get("exportedAt", "")
             if exported_at and (latest_export is None or exported_at > latest_export):
                 latest_export = exported_at
@@ -609,56 +614,277 @@ def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
             "count": len(snapshot_files),
             "source_paths": source_paths,
             "sources": source_machines,
+            "source_hosts": source_hosts,
             "latest_export": latest_export,
         })
 
     return projects
 
 
+def filter_snapshots_by_origin(
+    snapshot_files: list[Path],
+    source_host: Optional[str],
+    source_project_path: Optional[str] = None,
+) -> list[Path]:
+    """Keep only snapshots that match a known SSH origin.
+
+    When source_host is set, both host and normalized project path must
+    match. Snapshots from another host, another path on the same host, or
+    with a missing sourceHost are excluded.
+    """
+    if not source_host:
+        return list(snapshot_files)
+
+    target_path = (
+        os.path.normpath(source_project_path) if source_project_path else None
+    )
+    matched = []
+    for sf in snapshot_files:
+        meta = read_snapshot_meta(sf)
+        if meta.get("sourceHost") != source_host:
+            continue
+        if target_path is not None:
+            snap_path = os.path.normpath(meta.get("sourceProjectPath") or "")
+            if snap_path != target_path:
+                continue
+        matched.append(sf)
+    return matched
+
+
+def group_snapshots_by_origin(snapshot_files: list[Path]) -> dict[tuple, list[Path]]:
+    """Group snapshot files by (sourceHost, normalized sourceProjectPath)."""
+    groups: dict[tuple, list[Path]] = {}
+    for sf in snapshot_files:
+        meta = read_snapshot_meta(sf)
+        raw_path = meta.get("sourceProjectPath") or ""
+        norm_path = os.path.normpath(raw_path) if raw_path else ""
+        key = (meta.get("sourceHost"), norm_path)
+        groups.setdefault(key, []).append(sf)
+    return groups
+
+
+def workspaces_for_snapshot_meta(meta: dict) -> list[dict]:
+    """Workspaces that may receive a snapshot, honoring sourceHost when set."""
+    source_path = meta.get("sourceProjectPath") or ""
+    if not source_path:
+        return []
+    return paths.find_all_matching_workspaces(
+        source_path,
+        source_host=meta.get("sourceHost"),
+    )
+
+
+def path_only_snapshot_dir_is_safe(snapshot_files: list[Path]) -> bool:
+    """True if every snapshot is local/legacy (no sourceHost).
+
+    A mixed local+SSH bucket is unsafe for path-only pull/import: the
+    host-less batch filter would otherwise import the SSH files too.
+    """
+    return bool(snapshot_files) and all(
+        not read_snapshot_meta(sf).get("sourceHost")
+        for sf in snapshot_files
+    )
+
+
+def reject_cross_origin_import(
+    target_host: Optional[str],
+    snapshot_host: Optional[str],
+    target_project_path: Optional[str] = None,
+    snapshot_project_path: Optional[str] = None,
+) -> Optional[str]:
+    """Return an error if a snapshot must not go to this workspace.
+
+    When -w selects an SSH workspace, both host and normalized path must
+    match. Intentional moves belong on `cursaves copy`.
+    """
+    if target_host:
+        if snapshot_host != target_host:
+            return (
+                f"ERROR: target workspace belongs to {target_host}, "
+                f"but snapshot belongs to {snapshot_host or 'unknown host'}"
+            )
+        if target_project_path is not None:
+            target_path = os.path.normpath(target_project_path)
+            snap_path = os.path.normpath(snapshot_project_path or "")
+            if snap_path != target_path:
+                return (
+                    f"ERROR: target workspace is {target_host}:{target_path}, "
+                    f"but snapshot belongs to "
+                    f"{snapshot_host}:{snap_path or 'unknown path'}"
+                )
+    elif snapshot_host:
+        return (
+            f"ERROR: snapshot belongs to SSH host {snapshot_host}, "
+            "but target is not an explicitly selected SSH workspace; "
+            "use -w to select the target workspace"
+        )
+    return None
+
+
+def reject_cross_host_import(
+    target_host: Optional[str],
+    snapshot_host: Optional[str],
+    target_project_path: Optional[str] = None,
+    snapshot_project_path: Optional[str] = None,
+) -> Optional[str]:
+    """Backward-compatible alias for reject_cross_origin_import."""
+    return reject_cross_origin_import(
+        target_host,
+        snapshot_host,
+        target_project_path=target_project_path,
+        snapshot_project_path=snapshot_project_path,
+    )
+
+
+def pull_select_import_plan(
+    source_host: Optional[str],
+    target_workspaces: list[dict],
+) -> tuple[str, Optional[list[dict]]]:
+    """Decide how pull -s should handle one (sourceHost, path) group.
+
+    Returns:
+      ("import", workspaces) when a matching workspace exists
+      ("skip", None) when sourceHost is set and no workspace matches —
+          fail closed: never fall back to cwd or a manually entered path
+      ("fallback", None) when the snapshot has no sourceHost (legacy/local)
+          and no non-SSH workspace matched
+
+    Hostless snapshots are never auto-routed into SSH workspaces, even if
+    the legacy path/basename matcher returned them.
+    """
+    if source_host:
+        if target_workspaces:
+            return ("import", target_workspaces)
+        return ("skip", None)
+
+    local_targets = [
+        ws for ws in target_workspaces if ws.get("type") != "ssh"
+    ]
+    if local_targets:
+        return ("import", local_targets)
+    return ("fallback", None)
+
+
+def resolve_sync_import_targets(
+    meta: dict,
+    registered_composer_ids: Optional[dict[str, set[str]]] = None,
+) -> list[dict]:
+    """Choose workspaces for an automatic sync/pull of one snapshot.
+
+    Never returns a workspace whose SSH host differs from sourceHost when
+    sourceHost is present. Hostless/local snapshots must never be
+    auto-routed to SSH, but normal local/custom workspaces keep working.
+    If the conversation is not registered anywhere, the newest same-origin
+    match is used — not the first path-only match.
+    """
+    matches = workspaces_for_snapshot_meta(meta)
+
+    if not meta.get("sourceHost"):
+        matches = [ws for ws in matches if ws.get("type") != "ssh"]
+
+    if not matches:
+        return []
+
+    cid = meta.get("composerId") or ""
+    if registered_composer_ids is None:
+        registered_composer_ids = {}
+        for ws in matches:
+            ws_dir_str = str(ws["workspace_dir"])
+            ws_db_path = ws["workspace_dir"] / "state.vscdb"
+            if not ws_db_path.exists():
+                registered_composer_ids[ws_dir_str] = set()
+                continue
+            registered_composer_ids[ws_dir_str] = set(
+                paths.get_workspace_composer_ids(ws_db_path)
+            )
+
+    registered = [
+        ws
+        for ws in matches
+        if cid and cid in registered_composer_ids.get(str(ws["workspace_dir"]), set())
+    ]
+    if registered:
+        return registered
+    return matches[:1]
+
+
 def find_snapshot_dir_for_project(
     target_project_path: str,
     snapshots_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
 ) -> Optional[Path]:
     """Find the snapshot directory matching a project path.
 
     Tries in order:
-    1. Exact match by project identifier (git remote URL based)
-    2. Basename match (for SSH workspaces where git -C fails locally)
-    3. Scan snapshot metadata for matching sourceProjectPath basenames
+    1. Exact match by project identifier (git remote URL, or SSH host+path)
+    2. Basename match (legacy buckets such as snapshots/project/)
+    3. When source_host is set: scan remaining directories for snapshots
+       whose (sourceHost, normalized sourceProjectPath) match exactly.
+       This recovers SSH chats that landed in a bucket whose name is
+       neither the new identity nor the path basename.
+    4. When source_host is None: scan snapshot metadata for matching
+       sourceProjectPath basenames, skipping any directory that contains
+       SSH snapshots.
 
-    Returns the snapshot directory path, or None.
+    When source_host is set, a candidate directory is returned only if
+    it contains at least one snapshot whose (sourceHost, sourceProjectPath)
+    matches the target. Mixed-origin buckets are never accepted as an
+    unfiltered whole.
+
+    A path-only lookup (source_host is None) never auto-matches a directory
+    whose snapshots have sourceHost set. Remote SSH buckets must be pulled
+    with -w.
     """
     if snapshots_dir is None:
         snapshots_dir = paths.get_snapshots_dir()
 
-    # 1. Exact match by project identifier
-    project_id = paths.get_project_identifier(target_project_path)
+    project_id = paths.get_project_identifier(
+        target_project_path, source_host=source_host
+    )
     exact = snapshots_dir / project_id
-    if exact.exists() and list_snapshot_files(exact):
-        return exact
+    exact_files = list_snapshot_files(exact) if exact.exists() else []
+    if exact_files:
+        if source_host is not None or path_only_snapshot_dir_is_safe(exact_files):
+            return exact
 
-    # 2. Basename match (covers SSH workspace push → local pull)
     basename = os.path.basename(os.path.normpath(target_project_path))
     basename_dir = snapshots_dir / basename
-    if basename_dir.exists() and basename_dir != exact and list_snapshot_files(basename_dir):
-        return basename_dir
+    if basename_dir.exists() and basename_dir != exact:
+        basename_files = list_snapshot_files(basename_dir)
+        if source_host:
+            if filter_snapshots_by_origin(
+                basename_files,
+                source_host,
+                source_project_path=target_project_path,
+            ):
+                return basename_dir
+        elif path_only_snapshot_dir_is_safe(basename_files):
+            return basename_dir
 
-    # 3. Scan snapshot dirs for matching source path basenames
-    # This handles the case where the project was pushed from a different
-    # machine with a different directory structure but same repo
+    skipped = {exact, basename_dir}
+    if source_host:
+        for project_dir in sorted(snapshots_dir.iterdir()):
+            if not project_dir.is_dir() or project_dir in skipped:
+                continue
+            if filter_snapshots_by_origin(
+                list_snapshot_files(project_dir),
+                source_host,
+                source_project_path=target_project_path,
+            ):
+                return project_dir
+        return None
+
     for project_dir in snapshots_dir.iterdir():
-        if not project_dir.is_dir() or project_dir == exact or project_dir == basename_dir:
+        if not project_dir.is_dir() or project_dir in skipped:
             continue
-        # Check first snapshot file for a matching source path basename
-        for sf in list_snapshot_files(project_dir):
-            try:
-                data = read_snapshot_file(sf)
-                source_path = data.get("sourceProjectPath", "")
-                if source_path and os.path.basename(os.path.normpath(source_path)) == basename:
-                    return project_dir
-            except (json.JSONDecodeError, OSError, gzip.BadGzipFile):
-                pass
-            break  # Only need to check one file per directory
+        scan_files = list_snapshot_files(project_dir)
+        if not path_only_snapshot_dir_is_safe(scan_files):
+            continue
+        for sf in scan_files:
+            source_path = read_snapshot_meta(sf).get("sourceProjectPath") or ""
+            if source_path and os.path.basename(os.path.normpath(source_path)) == basename:
+                return project_dir
+            break
 
     return None
 
@@ -668,6 +894,7 @@ def import_from_snapshot_dir(
     target_project_path: str,
     force: bool = False,
     target_workspace_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
 ) -> tuple[int, int]:
     """Import all snapshots from a specific snapshot directory.
 
@@ -676,6 +903,8 @@ def import_from_snapshot_dir(
         target_project_path: The project path on this machine.
         force: Suppress Cursor-running warning.
         target_workspace_dir: Optional workspace directory to import into.
+        source_host: When set, import only snapshots from this SSH host
+            and the target project path.
 
     Returns (success_count, failure_count).
     """
@@ -690,7 +919,11 @@ def import_from_snapshot_dir(
         )
         return 0, 0
 
-    snapshot_files = list_snapshot_files(snapshot_dir)
+    snapshot_files = filter_snapshots_by_origin(
+        list_snapshot_files(snapshot_dir),
+        source_host,
+        source_project_path=target_project_path if source_host else None,
+    )
     if not snapshot_files:
         return 0, 0
 
@@ -729,6 +962,7 @@ def import_all_snapshots(
     snapshots_dir: Optional[Path] = None,
     force: bool = False,
     target_workspace_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
 ) -> tuple[int, int]:
     """Import all snapshots for a project.
 
@@ -737,6 +971,8 @@ def import_all_snapshots(
         snapshots_dir: Directory containing snapshot subdirectories.
         force: Suppress Cursor-running warning.
         target_workspace_dir: Optional workspace directory to import into.
+        source_host: When set, look up the SSH identity and never import
+            snapshots belonging to a different host.
 
     Returns (success_count, failure_count).
     """
@@ -754,15 +990,21 @@ def import_all_snapshots(
     if snapshots_dir is None:
         snapshots_dir = paths.get_snapshots_dir()
 
-    project_snapshots = find_snapshot_dir_for_project(target_project_path, snapshots_dir)
+    project_snapshots = find_snapshot_dir_for_project(
+        target_project_path, snapshots_dir, source_host=source_host
+    )
 
     if not project_snapshots:
-        project_id = paths.get_project_identifier(target_project_path)
+        project_id = paths.get_project_identifier(
+            target_project_path, source_host=source_host
+        )
         print(f"No snapshots found for project '{project_id}'", file=sys.stderr)
         print(f"Run 'cursaves snapshots' to see available snapshot projects.", file=sys.stderr)
         return 0, 0
 
-    project_id = paths.get_project_identifier(target_project_path)
+    project_id = paths.get_project_identifier(
+        target_project_path, source_host=source_host
+    )
     if project_snapshots.name != project_id:
         print(
             f"Note: Matched snapshots at {project_snapshots.name}/ "
@@ -773,6 +1015,7 @@ def import_all_snapshots(
     return import_from_snapshot_dir(
         project_snapshots, target_project_path, force=force,
         target_workspace_dir=target_workspace_dir,
+        source_host=source_host,
     )
 
 

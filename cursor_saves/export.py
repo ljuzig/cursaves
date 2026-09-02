@@ -475,7 +475,9 @@ def export_conversation(
             "sourceMachine": paths.get_machine_id(),
             "sourceHost": source_host,
             "sourceProjectPath": os.path.normpath(project_path),
-            "projectIdentifier": paths.get_project_identifier(project_path),
+            "projectIdentifier": paths.get_project_identifier(
+                project_path, source_host=source_host
+            ),
             "composerId": composer_id,
             "composerData": conv_data,
             "contentBlobs": blobs,

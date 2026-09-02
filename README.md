@@ -13,7 +13,7 @@ Cursor stores chats locally. Switch machines and they're gone. This tool saves y
 | **Chat**           | A conversation with the AI in Cursor                                                                                      |
 | **Workspace**      | Cursor creates one for each directory (or `.code-workspace` file) you open. Chats belong to workspaces.                   |
 | **Workspace hash** | The opaque directory name under `workspaceStorage/`; use with `-w` when number/path doesn't work (e.g. custom workspaces) |
-| **Project ID**     | How cursaves groups snapshots - based on git remote URL or directory name                                                 |
+| **Project ID**     | How cursaves groups snapshots — git remote URL, directory name, or `ssh-<host>-<path>` for Remote SSH                     |
 | **Snapshot**       | An exported chat saved to `~/.cursaves/snapshots/<project-id>/`                                                           |
 
 ### Chat → Workspace → Project Mapping
@@ -28,17 +28,21 @@ ssh://core/home/user/myapp   → Workspace C → [chat6, chat7]
 
 Each workspace is a unique path. Even the same repo cloned to different locations creates separate workspaces with separate chats.
 
-**cursaves groups snapshots by project identifier (git remote URL):**
+**cursaves groups snapshots by project identifier:**
 
 ```
-All three workspaces above have the same git remote:
+Local workspaces with the same git remote share one bucket:
   git@github.com:user/myapp.git
+  → ~/.cursaves/snapshots/github.com-user-myapp/
 
-So all their chats get saved to:
-  ~/.cursaves/snapshots/github.com-user-myapp/
+Remote SSH workspaces do not. The project path exists on the remote host,
+so git -C cannot be run locally. Identity is host + remote path instead:
+
+  ssh host-a /home/user/myapp  → ssh-host-a-home-user-myapp/
+  ssh host-b /home/user/myapp  → ssh-host-b-home-user-myapp/
 ```
 
-**On import, cursaves matches snapshots to local workspaces by path:**
+**On import, local snapshots match workspaces by path:**
 
 ```
 Machine A exports chat from: /Users/alice/repos/myapp
@@ -46,7 +50,9 @@ Machine B imports chat into: /Users/bob/repos/myapp  (same project ID, different
   → Paths in chat metadata are rewritten automatically
 ```
 
-This means you can sync chats for the same repo across different machines, even if the local paths differ.
+SSH snapshots match only the same host and exact remote path. A snapshot from `host-a` is never imported into `host-b`, even if the path is identical. Use `-w` to pull Remote SSH chats.
+
+This means you can sync chats for the same local repo across different machines, while SSH remotes stay isolated per host.
 
 ## Quick Start
 
@@ -85,6 +91,8 @@ cursaves push -w 497e8ab0   # by hash (from the Hash column)
 ```
 
 `push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports into Cursor's database. `sync` does both automatically — pulling conversations where your local copy is behind, and pushing ones where your local copy is ahead. After importing, restart Cursor (quit and reopen) to see the conversations.
+
+For Remote SSH workspaces, always pass `-w` so the host is part of the project identity. `pull -p` / a bare path will not auto-import SSH snapshots.
 
 ### Example
 
@@ -209,7 +217,7 @@ All commands default to the current working directory as the project path. Use `
 | `snapshots`    | List snapshot projects available in ~/.cursaves/           | No                    |
 | `status`       | Compare local conversations vs snapshots                   | No                    |
 | `repair`       | Restore missing agent blobs from snapshots                 | Yes                   |
-| `delete`       | Delete cached snapshots (interactive, by ID, or all)       | No                    |
+| `delete`       | Delete cached snapshots (interactive, by ID, `-w`, or all) | No                    |
 | `export <id>`  | Export one conversation to a snapshot                      | No                    |
 | `checkpoint`   | Export all conversations (no push)                         | No                    |
 | `import --all` | Import snapshots (no pull)                                 | Yes                   |
@@ -226,6 +234,9 @@ Most of the time you only need `sync`. Use `push -s` when you want to push speci
 ```bash
 # Run in a terminal on each machine -- handles everything automatically
 cursaves watch -p /path/to/your/project
+
+# Remote SSH: target the workspace so snapshots use the SSH identity
+cursaves watch -w 3
 
 # Options
 cursaves watch --interval 30     # check every 30s (default: 60)
@@ -257,13 +268,15 @@ For more details, see [docs/how-cursor-stores-chats.md](docs/how-cursor-stores-c
 
 ### Project identity
 
-Projects are identified by their **git remote origin URL**, not the local directory name. This means:
+Local projects are identified by their **git remote origin URL**, not the local directory name. This means:
 
 - `~/Projects/bob` and `~/repos/alice` with the same `origin` are treated as the same project -- conversations sync between them.
 - Two unrelated repos both named `myapp` won't collide, because their remotes differ.
 - Non-git directories fall back to matching by directory name.
 
-You can see what identity is being used with `cursaves status`.
+Remote SSH workspaces are identified by **host + remote path** (`ssh-<host>-<sanitized-path>`). The remote checkout is not on the machine running cursaves, so a local `git -C` would fail and collapse every host onto the same basename. Two SSH hosts that happen to use `/home/user/myapp` therefore get distinct buckets.
+
+You can see what identity is being used with `cursaves status` (pass `-w` for SSH).
 
 ### Path rewriting
 
@@ -347,14 +360,23 @@ cursaves push -w 497e8ab0    # By hash (for custom workspaces)
 ```bash
 # Interactive selection (recommended)
 cursaves pull -s
-#  → Shows available snapshots by project
-#  → Auto-detects matching SSH workspaces
-#  → Imports into the correct workspace
+#  → Groups selected chats by (host, path)
+#  → Imports each group only into that SSH workspace
+#  → Skips a group if no matching host is open (fail closed)
 
 # Or by workspace number, hash, or path
 cursaves workspaces          # List workspaces; note the #, Hash, or path
-cursaves pull -w 3           # By number
+cursaves pull -w 3           # By number — uses that host's identity
 cursaves pull -w 497e8ab0    # By hash
+```
+
+`pull -p /some/path` (no `-w`) never auto-resolves a snapshot bucket that contains Remote SSH chats. Use `-w` or `pull -s`.
+
+**Deleting SSH snapshot buckets:**
+
+```bash
+cursaves delete -w 3 --all   # the ssh-<host>-... bucket, not the basename
+cursaves delete -s           # pick buckets interactively
 ```
 
 **Important:** Run these commands in a **local terminal**, not in Cursor's integrated terminal (which runs on the remote server).
@@ -363,7 +385,9 @@ cursaves pull -w 497e8ab0    # By hash
 
 ### Custom workspaces (`.code-workspace`)
 
-If you use a VS Code/Cursor custom workspace (e.g. `my-proj.code-workspace`), it may not appear in `cursaves workspaces` with a recognizable path. In that case:
+A Remote SSH `.code-workspace` (the URI lives in the `workspace` field, not `folder`) is listed as type `ssh` with the remote host and the path to that file. Use `-w` the same way as for a remote folder.
+
+If a *local* custom workspace (e.g. `my-proj.code-workspace`) does not appear in `cursaves workspaces` with a recognizable path:
 
 1. Find the workspace hash: browse `~/Library/Application Support/Cursor/User/workspaceStorage/` (macOS) or `~/.config/Cursor/User/workspaceStorage/` (Linux) and locate the directory containing your chats.
 2. Use the hash as the workspace selector: `cursaves push -w <hash>` or `cursaves pull -w <hash>`.
@@ -384,7 +408,8 @@ The daemon handles checkpoint + git push/pull automatically. When you switch mac
 ```
 ~/.cursaves/                   # Local snapshot store
   snapshots/
-    github.com-user-repo/      # Identified by git remote URL
+    github.com-user-repo/      # Local project (git remote URL)
+    ssh-host-a-home-user-app/  # Remote SSH (host + remote path)
       <composer-id>.json.gz    # Self-contained conversation snapshot
   .git/                        # Present when using git backend
 

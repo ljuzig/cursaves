@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 
 def get_cursor_user_dir() -> Path:
@@ -89,6 +90,30 @@ def _decode_ssh_host(host: str) -> str:
     return host
 
 
+def _parse_ssh_remote_uri(uri: str) -> Optional[tuple[str, str]]:
+    """Parse a vscode-remote:// SSH URI into (host, path).
+
+    Accepts both folder and .code-workspace URIs. Only ssh-remote
+    authorities are treated as SSH; other vscode-remote schemes
+    (e.g. dev-container) are ignored.
+    """
+    parsed = urlsplit(uri)
+    if parsed.scheme != "vscode-remote":
+        return None
+    authority = unquote(parsed.netloc)
+    if authority.startswith("ssh-remote+"):
+        host = authority[len("ssh-remote+") :]
+    else:
+        return None
+    if not host:
+        return None
+    host = _decode_ssh_host(host)
+    path = unquote(parsed.path or "")
+    if not path or path == "/":
+        return None
+    return host, path
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
@@ -111,22 +136,17 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
+            folder_uri = data.get("folder") or ""
+            if not folder_uri:
+                folder_uri = data.get("workspace") or ""
             if folder_uri.startswith("file://"):
                 folder_path = folder_uri[len("file://") :]
-                # URL-decode common escapes
                 folder_path = folder_path.replace("%20", " ")
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
             else:
-                continue
+                parsed = _parse_ssh_remote_uri(folder_uri)
+                if parsed is None:
+                    continue
+                _host, folder_path = parsed
 
             if os.path.normpath(folder_path) == target:
                 matches.append(ws_dir)
@@ -187,7 +207,8 @@ def list_all_workspaces() -> list[dict]:
             folder_path = ""
             folder_uri = ""
 
-            # workspace .code-workspace: uses "workspace" key instead of "folder"
+            # .code-workspace files use "workspace" instead of "folder".
+            # Remote SSH multi-root workspaces use the same vscode-remote URI.
             if "workspace" in data and not data.get("folder"):
                 ws_uri = data["workspace"]
                 if ws_uri.startswith("file://"):
@@ -196,7 +217,12 @@ def list_all_workspaces() -> list[dict]:
                     folder_path = folder_path.replace("%20", " ")
                     ws_type = "workspace"
                 else:
-                    continue
+                    parsed = _parse_ssh_remote_uri(ws_uri)
+                    if parsed is None:
+                        continue
+                    host, folder_path = parsed
+                    folder_uri = ws_uri
+                    ws_type = "ssh"
             else:
                 folder_uri = data.get("folder", "")
                 if not folder_uri:
@@ -205,24 +231,12 @@ def list_all_workspaces() -> list[dict]:
                 if folder_uri.startswith("file://"):
                     folder_path = folder_uri[len("file://") :]
                     folder_path = folder_path.replace("%20", " ")
-                elif folder_uri.startswith("vscode-remote://"):
-                    ws_type = "ssh"
-                    # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                    authority = folder_uri.split("/")[2]  # ssh-remote%2B<host>
-                    if "%2B" in authority:
-                        host = authority.split("%2B", 1)[1]
-                    elif "+" in authority:
-                        host = authority.split("+", 1)[1]
-                    # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
-                    if host:
-                        host = _decode_ssh_host(host)
-                    parts = folder_uri.split("/", 3)
-                    if len(parts) >= 4:
-                        folder_path = "/" + parts[3]
-                    else:
-                        continue
                 else:
-                    continue
+                    parsed = _parse_ssh_remote_uri(folder_uri)
+                    if parsed is None:
+                        continue
+                    host, folder_path = parsed
+                    ws_type = "ssh"
 
             # Get DB modification time
             db_path = ws_dir / "state.vscdb"
@@ -461,12 +475,20 @@ def get_machine_id() -> str:
 # ── Workspace matching for imports ─────────────────────────────────────
 
 
-def find_all_matching_workspaces(source_path: str) -> list[dict]:
+def find_all_matching_workspaces(
+    source_path: str,
+    source_host: Optional[str] = None,
+) -> list[dict]:
     """Find all workspaces that could receive imports from source_path.
 
     Matches by:
     1. Exact path match (for SSH workspaces with same remote path)
     2. Same basename (fallback for different directory structures)
+
+    When source_host is provided, matching is restricted to SSH workspaces
+    with that exact host AND the exact remote path. There is no fallback to
+    a different host, and no basename guess on the same host — better to
+    match nothing than import a chat into the wrong workspace.
 
     Returns list of workspace dicts with type, host, path, workspace_dir,
     sorted by match quality (exact matches first) then by mtime.
@@ -475,11 +497,22 @@ def find_all_matching_workspaces(source_path: str) -> list[dict]:
     source_normalized = os.path.normpath(source_path)
     source_basename = os.path.basename(source_normalized)
 
+    if source_host:
+        matches = [
+            ws
+            for ws in all_ws
+            if ws.get("type") == "ssh"
+            and ws.get("host") == source_host
+            and os.path.normpath(ws["path"]) == source_normalized
+        ]
+        matches.sort(key=lambda w: w.get("mtime", 0), reverse=True)
+        return matches
+
     exact_matches = []
     basename_matches = []
 
     for ws in all_ws:
-        ws_path = ws["path"]
+        ws_path = os.path.normpath(ws["path"])
         ws_basename = os.path.basename(ws_path)
 
         if ws_path == source_normalized:
@@ -524,7 +557,10 @@ def format_workspace_display(ws: dict, include_path: bool = True) -> str:
 # ── Project identification ────────────────────────────────────────────
 
 
-def get_project_identifier(project_path: str) -> str:
+def get_project_identifier(
+    project_path: str,
+    source_host: Optional[str] = None,
+) -> str:
     """Get a stable identifier for a project, used as the snapshot subdirectory.
 
     Uses the git remote origin URL if available (normalized to a filesystem-safe
@@ -533,11 +569,25 @@ def get_project_identifier(project_path: str) -> str:
     This means:
       - Same repo under different local names (bob/ vs alice/) → same identifier
       - Different repos that happen to share a name → different identifiers
+
+    The project path of a Remote SSH workspace exists on the remote host,
+    not necessarily on the machine running cursaves. Therefore git -C
+    cannot reliably discover remote.origin.url locally. When source_host is
+    set, identity is derived from host + normalized remote path instead.
     """
+    if source_host:
+        normalized_path = os.path.normpath(project_path)
+        return _sanitize_identifier(f"ssh/{source_host}/{normalized_path}")
+
     remote_url = _get_git_remote_url(project_path)
     if remote_url:
         return _normalize_remote_url(remote_url)
     return os.path.basename(os.path.normpath(project_path))
+
+
+def get_workspace_project_identifier(ws: dict) -> str:
+    """Project identifier for a workspace dict, including SSH host when present."""
+    return get_project_identifier(ws["path"], source_host=ws.get("host"))
 
 
 def _get_git_remote_url(project_path: str) -> Optional[str]:
