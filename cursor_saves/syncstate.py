@@ -481,6 +481,7 @@ class SnapshotIndex:
     _remote_units: dict[tuple[str, str], list[str]] = field(default_factory=dict)
     _remote_digest: dict[tuple[str, str], str] = field(default_factory=dict)
     cache: SemanticsCache = field(default_factory=SemanticsCache)
+    scoped_project_identifier: Optional[str] = None
 
     @classmethod
     def build(
@@ -492,7 +493,7 @@ class SnapshotIndex:
         if project_identifier:
             _counts.pull_target_scans += 1
         root = snapshots_dir if snapshots_dir is not None else paths.get_snapshots_dir()
-        index = cls()
+        index = cls(scoped_project_identifier=project_identifier)
         if not root.exists():
             return index
         if project_identifier:
@@ -510,7 +511,12 @@ class SnapshotIndex:
         project_identifier: str,
         snapshots_dir: Optional[Path] = None,
     ) -> "SnapshotIndex":
-        """Index only ``snapshots/<project_identifier>/``."""
+        """Index only ``snapshots/<project_identifier>/``.
+
+        Records the bucket name on ``scoped_project_identifier`` so a
+        targeted planner can look up snapshots in a legacy directory
+        (e.g. ``nixos/``) instead of the canonical SSH identity.
+        """
         return cls.build(
             snapshots_dir=snapshots_dir,
             project_identifier=project_identifier,
@@ -882,6 +888,7 @@ class PlannedItem:
 @dataclass
 class SyncPlan:
     items: list[PlannedItem] = field(default_factory=list)
+    target_workspace: Optional[dict] = None
 
     def by_relation(self, relation: SyncRelation) -> list[PlannedItem]:
         return [i for i in self.items if i.relation == relation]
@@ -1020,14 +1027,37 @@ def build_sync_plan(
     session: SyncReadSession,
     index: SnapshotIndex,
     workspaces: Optional[list[dict]] = None,
+    target_workspace: Optional[dict] = None,
 ) -> SyncPlan:
-    """Classify every local conversation and every snapshot. Read-only."""
-    plan = SyncPlan()
+    """Classify local conversations and snapshots. Read-only.
+
+    With *target_workspace*, only that workspace is classified. Other
+    hosts and workspaces never enter the plan — including a diverged
+    chat on an unselected workspace. Without it, every workspace is
+    classified (the historical global ``sync``).
+    """
+    plan = SyncPlan(target_workspace=target_workspace)
     seen: set[tuple[str, str]] = set()
     session.cache = index.cache
 
-    if workspaces is None:
+    if target_workspace is not None:
+        workspaces = [target_workspace]
+    elif workspaces is None:
         workspaces = paths.list_workspaces_with_conversations()
+
+    target_ids: Optional[set[str]] = None
+    snapshot_project_id: Optional[str] = None
+    if target_workspace is not None:
+        target_ids = _target_workspace_composer_ids(target_workspace)
+        # Identity of the already-resolved snapshot bucket, not the
+        # canonical workspace ID. A scoped index of snapshots/nixos/
+        # must still match SSH chats whose workspace ID is
+        # ssh-MindLoop1-home-lju-nixos. Host + path stay exact via
+        # index.get / _record_matches_target.
+        snapshot_project_id = (
+            index.scoped_project_identifier
+            or paths.get_workspace_project_identifier(target_workspace)
+        )
 
     for ws in workspaces:
         ws_dir = ws["workspace_dir"]
@@ -1035,21 +1065,22 @@ def build_sync_plan(
         if not db_path.exists():
             continue
         project_id = paths.get_workspace_project_identifier(ws)
+        lookup_id = snapshot_project_id or project_id
         composer_ids = paths.get_workspace_composer_ids(db_path)
         for cid in composer_ids:
-            key = (project_id, cid)
+            key = (lookup_id, cid)
             if key in seen:
                 continue
             seen.add(key)
             rec = index.get(
                 cid,
-                project_id,
+                lookup_id,
                 source_host=ws.get("host"),
                 source_path=ws.get("path"),
             )
             try:
                 relation = classify_conversation(
-                    session, index, cid, workspace=ws, project_identifier=project_id
+                    session, index, cid, workspace=ws, project_identifier=lookup_id
                 )
             except ClassifyError:
                 relation = SyncRelation.UNKNOWN
@@ -1063,7 +1094,7 @@ def build_sync_plan(
                     workspace_dir=ws_dir,
                     project_path=ws.get("path") or "",
                     source_host=ws.get("host"),
-                    project_identifier=project_id,
+                    project_identifier=lookup_id,
                 )
             )
 
@@ -1071,6 +1102,17 @@ def build_sync_plan(
         key = (rec.project_identifier, rec.composer_id)
         if key in seen:
             continue
+        if target_workspace is not None:
+            if not _record_matches_target(rec, target_workspace):
+                continue
+            if rec.project_identifier != snapshot_project_id:
+                continue
+            # CID present globally but not in this workspace belongs to
+            # someone else. Do not treat it as this target's behind.
+            if rec.composer_id not in (
+                target_ids or set()
+            ) and _global_has_composer(session, rec.composer_id):
+                continue
         seen.add(key)
         # No local workspace registered this CID for this origin. Do not
         # consult the global composer: it may belong to another project.
@@ -1083,6 +1125,14 @@ def build_sync_plan(
                 relation = SyncRelation.UNKNOWN
             else:
                 relation = SyncRelation.BEHIND
+        if target_workspace is not None:
+            remote_ws_dir = target_workspace.get("workspace_dir")
+            remote_path = target_workspace.get("path") or ""
+            remote_host = target_workspace.get("host")
+        else:
+            remote_ws_dir = None
+            remote_path = rec.meta.get("sourceProjectPath") or ""
+            remote_host = rec.meta.get("sourceHost")
         plan.items.append(
             PlannedItem(
                 composer_id=rec.composer_id,
@@ -1090,9 +1140,10 @@ def build_sync_plan(
                 name=rec.meta.get("name") or "Untitled",
                 snapshot_path=rec.path,
                 meta=rec.meta,
+                workspace_dir=remote_ws_dir,
+                project_path=remote_path,
+                source_host=remote_host,
                 project_identifier=rec.project_identifier,
-                source_host=rec.meta.get("sourceHost"),
-                project_path=rec.meta.get("sourceProjectPath") or "",
             )
         )
     index.cache.flush()

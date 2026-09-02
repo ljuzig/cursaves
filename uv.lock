@@ -41,7 +41,7 @@ wheels = [
 
 [[package]]
 name = "cursaves"
-version = "0.9.6"
+version = "0.9.7"
 source = { editable = "." }
 dependencies = [
     { name = "inquirerpy" },
