@@ -26,6 +26,10 @@ from .importer import (
     read_snapshot_file,
     read_snapshot_meta,
     repair_missing_blobs,
+    group_snapshots_by_origin,
+    pull_select_import_plan,
+    reject_cross_origin_import,
+    resolve_sync_import_targets,
 )
 
 
@@ -141,7 +145,7 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
     if not composer_ids:
         return ""
 
-    project_id = paths.get_project_identifier(ws["path"])
+    project_id = paths.get_workspace_project_identifier(ws)
 
     counts = {"up_to_date": 0, "local_ahead": 0, "behind": 0, "never_pushed": 0}
     for cid in composer_ids:
@@ -223,7 +227,11 @@ def cmd_snapshots(args):
     try:
         for i, p in enumerate(projects, 1):
             name = p["name"]
-            print(f"\n  {name}/ ({p['count']} snapshot(s))")
+            hosts = ", ".join(sorted(p.get("source_hosts") or []))
+            if hosts:
+                print(f"\n  {name}/ ({p['count']} snapshot(s), from {hosts})")
+            else:
+                print(f"\n  {name}/ ({p['count']} snapshot(s))")
 
             snapshot_files = list_snapshot_files(p["path"])
             for sf in snapshot_files:
@@ -377,11 +385,13 @@ def cmd_list(args):
 
 def cmd_export(args):
     """Export a single conversation to a snapshot file."""
-    project_path = _resolve_project(args)
+    project_path, _workspace_dir, source_host = _resolve_project_and_workspace(args)
     composer_id = args.id
 
     print(f"Exporting conversation {composer_id}...")
-    snapshot = export.export_conversation(project_path, composer_id)
+    snapshot = export.export_conversation(
+        project_path, composer_id, source_host=source_host
+    )
 
     if snapshot is None:
         print(f"Error: Conversation '{composer_id}' not found.", file=sys.stderr)
@@ -402,10 +412,12 @@ def cmd_export(args):
 
 def cmd_checkpoint(args):
     """Checkpoint all conversations for the current project."""
-    project_path, workspace_dir, _ = _resolve_project_and_workspace(args)
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
 
     print(f"Checkpointing conversations for {project_path}...")
-    saved = export.checkpoint_project(project_path, workspace_dir=workspace_dir)
+    saved = export.checkpoint_project(
+        project_path, workspace_dir=workspace_dir, source_host=source_host
+    )
 
     if not saved:
         print("No conversations found to checkpoint.")
@@ -421,13 +433,15 @@ def cmd_checkpoint(args):
 
 def cmd_import(args):
     """Import conversation snapshots."""
-    project_path = _resolve_project(args)
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
 
     if args.all:
         print(f"Importing all snapshots for {project_path}...")
         success, failure = import_all_snapshots(
             project_path,
             force=args.force,
+            target_workspace_dir=workspace_dir,
+            source_host=source_host,
         )
         print(f"\nDone: {success} imported, {failure} failed.")
         if success > 0:
@@ -437,8 +451,22 @@ def cmd_import(args):
         if not snapshot_path.exists():
             print(f"Error: File not found: {snapshot_path}", file=sys.stderr)
             sys.exit(1)
+        meta = read_snapshot_meta(snapshot_path)
+        origin_error = reject_cross_origin_import(
+            source_host,
+            meta.get("sourceHost"),
+            target_project_path=project_path,
+            snapshot_project_path=meta.get("sourceProjectPath"),
+        )
+        if origin_error:
+            print(origin_error, file=sys.stderr)
+            sys.exit(1)
         print(f"Importing {snapshot_path.name}...")
-        if import_snapshot(snapshot_path, project_path):
+        if import_snapshot(
+            snapshot_path,
+            project_path,
+            target_workspace_dir=workspace_dir,
+        ):
             print("Done.")
             _maybe_reload(args)
         else:
@@ -449,11 +477,15 @@ def cmd_import(args):
         sys.exit(1)
 
 
-def _select_target_workspaces(source_paths: set[str]) -> list[dict]:
+def _select_target_workspaces(
+    source_paths: set[str],
+    source_host: Optional[str] = None,
+) -> list[dict]:
     """Find and optionally prompt user to select target workspaces for import.
 
     Args:
         source_paths: Set of source project paths from snapshots.
+        source_host: When set, only SSH workspaces on this host are considered.
 
     Returns:
         List of workspace dicts to import into, or empty list if cancelled.
@@ -463,7 +495,7 @@ def _select_target_workspaces(source_paths: set[str]) -> list[dict]:
     all_matches = []
     seen_ws_dirs = set()
     for sp in sorted(source_paths):
-        matches = paths.find_all_matching_workspaces(sp)
+        matches = paths.find_all_matching_workspaces(sp, source_host=source_host)
         for ws in matches:
             ws_dir_str = str(ws["workspace_dir"])
             if ws_dir_str not in seen_ws_dirs:
@@ -631,7 +663,7 @@ def _find_ahead_conversations() -> list[dict]:
             if not composer_ids:
                 continue
 
-            project_id = paths.get_project_identifier(ws["path"])
+            project_id = paths.get_workspace_project_identifier(ws)
 
             for cid in composer_ids:
                 status = get_push_status_for_conversation(cid, project_id, _cdb=global_cdb)
@@ -848,39 +880,12 @@ def _pull_behind(sync_dir: Path) -> int:
             if not behind_snapshots:
                 continue
 
-            # Find all matching workspaces for this project
-            all_matches = []
-            seen_ws_dirs: set[str] = set()
-            for sp in sorted(project.get("source_paths", set())):
-                matches = paths.find_all_matching_workspaces(sp)
-                for ws in matches:
-                    ws_dir_str = str(ws["workspace_dir"])
-                    if ws_dir_str not in seen_ws_dirs:
-                        seen_ws_dirs.add(ws_dir_str)
-                        all_matches.append(ws)
-
-            if not all_matches:
-                continue
-
-            # Build a map: composerId -> list of workspaces that have it registered
-            cid_to_workspaces: dict[str, list[dict]] = {}
-            for ws in all_matches:
-                ws_db_path = ws["workspace_dir"] / "state.vscdb"
-                if not ws_db_path.exists():
-                    continue
-                ws_composer_ids = set(paths.get_workspace_composer_ids(ws_db_path))
-                for sf, meta in behind_snapshots:
-                    cid = meta.get("composerId", "")
-                    if cid in ws_composer_ids:
-                        cid_to_workspaces.setdefault(cid, []).append(ws)
-
             for sf, meta in behind_snapshots:
                 cid = meta.get("composerId", "")
-                target_list = cid_to_workspaces.get(cid, [])
+                target_list = resolve_sync_import_targets(meta)
 
                 if not target_list:
-                    # Not registered anywhere — pick the first matching workspace
-                    target_list = all_matches[:1]
+                    continue
 
                 for ws in target_list:
                     if not backed_up_global and global_db_path.exists():
@@ -1133,45 +1138,71 @@ def cmd_pull(args):
             selected_files = [s["file"] for s in selected_snaps]
             print(f"\n  Importing {len(selected_files)} chat(s) from {project['name']}/...")
 
-            # Find target workspace
-            target_workspaces = _select_target_workspaces(project["source_paths"])
+            origin_groups = group_snapshots_by_origin(selected_files)
+            if len(origin_groups) > 1:
+                print(
+                    f"  Selected chats span {len(origin_groups)} SSH host/path "
+                    f"origin(s); importing each group into its own workspace."
+                )
 
-            if not target_workspaces:
-                cwd = os.getcwd()
-                cwd_basename = os.path.basename(os.path.normpath(cwd))
-                source_basenames = {os.path.basename(os.path.normpath(sp)) for sp in project["source_paths"]}
-                if cwd_basename in source_basenames or project["name"] == paths.get_project_identifier(cwd):
-                    target_path = cwd
-                else:
-                    print(f"  No matching workspaces found.")
-                    print(f"  Enter a local project path to import into (or press Enter to skip):")
-                    try:
-                        target_path = input("  > ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        print()
-                        continue
-                    if not target_path:
-                        print("  Skipped.")
-                        continue
+            for (snap_host, snap_path), group_files in origin_groups.items():
+                origin_paths = {snap_path} if snap_path else set()
+                target_workspaces = _select_target_workspaces(
+                    origin_paths, source_host=snap_host
+                )
+                action, target_workspaces = pull_select_import_plan(
+                    snap_host, target_workspaces
+                )
 
-                for sf in selected_files:
-                    print(f"  Importing {sf.name}...")
-                    if import_snapshot(sf, target_path):
-                        total_success += 1
-                        print(f"    OK")
+                if action == "skip":
+                    print(
+                        f"  No matching SSH workspace found for "
+                        f"{snap_host}:{snap_path}; skipped."
+                    )
+                    total_failure += len(group_files)
+                    continue
+
+                if action == "fallback":
+                    cwd = os.getcwd()
+                    cwd_basename = os.path.basename(os.path.normpath(cwd))
+                    source_basenames = {
+                        os.path.basename(os.path.normpath(sp)) for sp in origin_paths
+                    }
+                    if cwd_basename in source_basenames or project["name"] == paths.get_project_identifier(cwd):
+                        target_path = cwd
                     else:
-                        total_failure += 1
-                        print(f"    FAILED")
-            else:
-                for ws in target_workspaces:
-                    display = paths.format_workspace_display(ws)
-                    print(f"  Importing into: {display}")
-                    for sf in selected_files:
-                        print(f"    {sf.name}...")
-                        if import_snapshot(sf, ws["path"], target_workspace_dir=ws["workspace_dir"]):
+                        origin_label = (
+                            f"{snap_host}:{snap_path}" if snap_host else snap_path or "unknown"
+                        )
+                        print(f"  No matching workspaces found for {origin_label}.")
+                        print(f"  Enter a local project path to import into (or press Enter to skip):")
+                        try:
+                            target_path = input("  > ").strip()
+                        except (EOFError, KeyboardInterrupt):
+                            print()
+                            continue
+                        if not target_path:
+                            print("  Skipped.")
+                            continue
+
+                    for sf in group_files:
+                        print(f"  Importing {sf.name}...")
+                        if import_snapshot(sf, target_path):
                             total_success += 1
+                            print(f"    OK")
                         else:
                             total_failure += 1
+                            print(f"    FAILED")
+                else:
+                    for ws in target_workspaces:
+                        display = paths.format_workspace_display(ws)
+                        print(f"  Importing into: {display}")
+                        for sf in group_files:
+                            print(f"    {sf.name}...")
+                            if import_snapshot(sf, ws["path"], target_workspace_dir=ws["workspace_dir"]):
+                                total_success += 1
+                            else:
+                                total_failure += 1
 
         if total_success == 0 and total_failure == 0:
             print("\nNo snapshots imported.")
@@ -1182,15 +1213,11 @@ def cmd_pull(args):
             _maybe_reload(args)
     else:
         # Non-interactive: import for the resolved project/workspace
-        project_path, workspace_dir = _resolve_workspace_for_import(args)
+        project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
         if workspace_dir:
-            # Show which workspace we're importing into
-            ws_info = paths.format_workspace_display(
-                {"type": "ssh" if "ssh" in str(workspace_dir) else "local",
-                 "host": None, "path": project_path},
-                include_path=True
-            )
             print(f"Importing into workspace: {project_path}")
+            if source_host:
+                print(f"  SSH host: {source_host}")
         else:
             print(f"Importing snapshots for {project_path}...")
 
@@ -1198,6 +1225,7 @@ def cmd_pull(args):
             project_path,
             force=args.force,
             target_workspace_dir=workspace_dir,
+            source_host=source_host,
         )
 
         if success == 0 and failure == 0:
@@ -1211,9 +1239,11 @@ def cmd_pull(args):
 
 def cmd_watch(args):
     """Run the background watch daemon."""
-    project_path = _resolve_project(args)
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
     watch_loop(
         project_path=project_path,
+        workspace_dir=workspace_dir,
+        source_host=source_host,
         interval=args.interval,
         git_sync=not args.no_git,
         verbose=args.verbose,
@@ -1276,8 +1306,8 @@ def cmd_copy(args):
 def cmd_status(args):
     """Show sync status -- what's local vs what's in snapshots."""
     _ensure_synced()  # Pull latest from remote first
-    project_path, workspace_dir, _ = _resolve_project_and_workspace(args)
-    project_id = paths.get_project_identifier(project_path)
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
+    project_id = paths.get_project_identifier(project_path, source_host=source_host)
     snapshots_dir = paths.get_snapshots_dir() / project_id
 
     # Get local conversations
@@ -1410,9 +1440,9 @@ def cmd_delete(args):
             print("Synced to remote.")
         return
 
-    # Single project mode (original behavior)
-    project_path = args.project or paths.get_project_path()
-    project_id = paths.get_project_identifier(project_path)
+    # Single project mode
+    project_path, _workspace_dir, source_host = _resolve_project_and_workspace(args)
+    project_id = paths.get_project_identifier(project_path, source_host=source_host)
     snapshots_dir = snapshots_base / project_id
 
     if not snapshots_dir.exists():
@@ -1839,7 +1869,7 @@ def main():
     p_delete = subparsers.add_parser(
         "delete", help="Delete cached snapshots"
     )
-    p_delete.add_argument("--project", "-p", help="Project path (default: current directory)")
+    add_project_args(p_delete)
     p_delete.add_argument("--all", action="store_true", help="Delete all snapshots for the project")
     p_delete.add_argument("--id", help="Delete a specific snapshot by ID (supports partial match)")
     p_delete.add_argument(
