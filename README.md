@@ -293,7 +293,7 @@ Note: "Developer: Reload Window" is not sufficient -- it reloads the renderer bu
 ## Safety
 
 - **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) work on a temporary copy of the database. They never touch Cursor's files and are safe to run while Cursor is open.
-- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while Cursor is detected as running. Use `--force` to override (not recommended).
+- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while the Cursor desktop app is detected as running (macOS and Linux). Use `--force` to override (not recommended).
 - Snapshots are self-contained JSON -- even if import goes wrong, you always have the raw data and the backup.
 
 ## Privacy Warning
