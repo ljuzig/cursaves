@@ -455,7 +455,7 @@ def test_sync_releases_sqlite_before_repo(sqlite_lock, tmp_path, monkeypatch):
 
     monkeypatch.setattr(dblock, "repo_lock", guarded_repo_lock)
 
-    def fake_pull_behind(sync_dir):
+    def fake_pull_behind(sync_dir, plan=None):
         with db.CursorDB(db_path) as cdb:
             cdb.write_item("hello", "behind")
             assert db.write_connections_open()
@@ -465,7 +465,7 @@ def test_sync_releases_sqlite_before_repo(sqlite_lock, tmp_path, monkeypatch):
         order.append("cursor_write")
         return 1
 
-    def fake_push_ahead(sync_dir, auto=False, backend=None):
+    def fake_push_ahead(sync_dir, auto=False, backend=None, plan=None, session=None):
         assert not db.write_connections_open()
         assert not dblock.is_write_lock_held()
         with dblock.repo_lock():

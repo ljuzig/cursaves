@@ -18,19 +18,54 @@ def _get_shard_paths(base_path: Path) -> list[Path]:
     return [s for s in shards if s.suffix.lstrip(".").isdigit()]
 
 
-def read_snapshot_file(path: Path) -> dict:
+def snapshot_component_files(
+    snapshot_path: Path, meta: Optional[dict] = None
+) -> list[Path]:
+    """Files that constitute this snapshot: the main file and any shards.
+
+    This is the shared definition of on-disk identity for ``read_snapshot_file``
+    and the sync cache. Missing paths are omitted.
+    """
+    files: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path) -> None:
+        if path in seen or not path.exists():
+            return
+        seen.add(path)
+        files.append(path)
+
+    _add(snapshot_path)
+    for shard in _get_shard_paths(snapshot_path):
+        _add(shard)
+    if meta:
+        try:
+            count = int(meta.get("shardCount") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        for i in range(count):
+            _add(snapshot_path.parent / f"{snapshot_path.name}.{i:02d}")
+    return files
+
+
+def read_snapshot_file(path: Path, meta: Optional[dict] = None) -> dict:
     """Read a snapshot file (supports .json, .json.gz, and sharded .json.gz.NN)."""
     if path.suffix == ".gz":
-        # Check for shards first
-        shards = _get_shard_paths(path)
-        if shards and not path.exists():
+        components = snapshot_component_files(path, meta)
+        shards = [p for p in components if p != path]
+        if shards and path not in components:
             compressed = b"".join(s.read_bytes() for s in shards)
             raw = gzip.decompress(compressed)
             return json.loads(raw)
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        return json.loads(path.read_text())
+        if path.exists():
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        if shards:
+            compressed = b"".join(s.read_bytes() for s in shards)
+            raw = gzip.decompress(compressed)
+            return json.loads(raw)
+        raise FileNotFoundError(path)
+    return json.loads(path.read_text())
 
 
 def list_snapshot_files(directory: Path) -> list[Path]:
@@ -444,91 +479,67 @@ def get_sync_status_for_snapshot(
     composer_id: str,
     snapshot_msg_count: int,
     _cdb: "Optional[db.CursorDB]" = None,
+    *,
+    session=None,
+    index=None,
+    project_identifier=None,
 ) -> str:
-    """Lightweight sync status check using only message counts.
+    """Semantic sync status for a snapshot vs local Cursor state.
 
-    Compares the local header count against the snapshot's messageCount
-    from the .meta.json sidecar (no decompression needed).
-
-    Pass an open CursorDB via _cdb to avoid re-copying the global DB.
-
-    Returns one of:
-      "not_local"     - conversation doesn't exist in local DB
-      "up_to_date"    - same message count
-      "local_ahead"   - local has more messages than snapshot
-      "behind"        - snapshot has more messages than local
+    ``snapshot_msg_count`` is accepted for call-site compatibility and is
+    not used to decide the relation.
     """
-    if _cdb is not None:
-        local_data = _cdb.get_json(f"composerData:{composer_id}")
-    else:
-        global_db_path = paths.get_global_db_path()
-        if not global_db_path.exists():
-            return "not_local"
-        with db.CursorDB(global_db_path) as cdb:
-            local_data = cdb.get_json(f"composerData:{composer_id}")
+    from . import syncstate
 
-    if not local_data:
-        return "not_local"
-
-    local_count = len(local_data.get("fullConversationHeadersOnly", []))
-
-    if local_count == snapshot_msg_count:
-        return "up_to_date"
-    elif local_count > snapshot_msg_count:
-        return "local_ahead"
-    else:
-        return "behind"
+    if session is not None and index is not None:
+        return syncstate.classify_snapshot_vs_local(
+            session, index, composer_id, project_identifier=project_identifier
+        )
+    with syncstate.SyncReadSession() as owned:
+        idx = index if index is not None else syncstate.SnapshotIndex.build()
+        owned.cache = idx.cache
+        return syncstate.classify_snapshot_vs_local(
+            owned, idx, composer_id, project_identifier=project_identifier
+        )
 
 
 def get_push_status_for_conversation(
     composer_id: str,
     project_identifier: str,
     _cdb: "Optional[db.CursorDB]" = None,
+    *,
+    session=None,
+    index=None,
+    source_host=None,
+    source_path=None,
 ) -> str:
-    """Check whether a local conversation has been pushed and if the snapshot is current.
+    """Semantic push status for a local conversation vs its origin snapshot.
 
-    Pass an open CursorDB via _cdb to avoid re-copying the global DB.
-
-    Returns one of:
-      "never_pushed"  - no snapshot exists for this conversation
-      "up_to_date"    - snapshot matches local message count
-      "local_ahead"   - local has more messages than the snapshot
-      "behind"        - snapshot has more messages (pushed from elsewhere)
+    Lookup is ``(project_identifier, composer_id)``. There is no
+    cross-project or cross-host fallback.
     """
-    snapshots_dir = paths.get_snapshots_dir()
-    project_dir = snapshots_dir / project_identifier
-    if not project_dir.exists():
-        return "never_pushed"
+    from . import syncstate
 
-    meta_path = project_dir / f"{composer_id}.meta.json"
-    if not meta_path.exists():
-        return "never_pushed"
-
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return "never_pushed"
-
-    snapshot_count = meta.get("messageCount", 0)
-
-    if _cdb is not None:
-        local_data = _cdb.get_json(f"composerData:{composer_id}")
-    else:
-        global_db_path = paths.get_global_db_path()
-        with db.CursorDB(global_db_path) as cdb:
-            local_data = cdb.get_json(f"composerData:{composer_id}")
-
-    if not local_data:
-        return "never_pushed"
-
-    local_count = len(local_data.get("fullConversationHeadersOnly", []))
-
-    if local_count == snapshot_count:
-        return "up_to_date"
-    elif local_count > snapshot_count:
-        return "local_ahead"
-    else:
-        return "behind"
+    if session is not None and index is not None:
+        return syncstate.classify_conversation(
+            session,
+            index,
+            composer_id,
+            project_identifier=project_identifier,
+            source_host=source_host,
+            source_path=source_path,
+        ).value
+    with syncstate.SyncReadSession() as owned:
+        idx = index if index is not None else syncstate.SnapshotIndex.build()
+        owned.cache = idx.cache
+        return syncstate.classify_conversation(
+            owned,
+            idx,
+            composer_id,
+            project_identifier=project_identifier,
+            source_host=source_host,
+            source_path=source_path,
+        ).value
 
 
 _SYNC_STATUS_LABELS = {
@@ -537,6 +548,8 @@ _SYNC_STATUS_LABELS = {
     "local_ahead": "ahead",
     "behind": "behind",
     "never_pushed": "not pushed",
+    "diverged": "diverged",
+    "unknown": "unknown",
 }
 
 
@@ -613,7 +626,9 @@ def filter_snapshots_by_origin(
         return list(snapshot_files)
 
     target_path = (
-        os.path.normpath(source_project_path) if source_project_path else None
+        paths.normalize_origin_path(source_project_path, source_host=source_host)
+        if source_project_path
+        else None
     )
     matched = []
     for sf in snapshot_files:
@@ -621,7 +636,9 @@ def filter_snapshots_by_origin(
         if meta.get("sourceHost") != source_host:
             continue
         if target_path is not None:
-            snap_path = os.path.normpath(meta.get("sourceProjectPath") or "")
+            snap_path = paths.normalize_origin_path(
+                meta.get("sourceProjectPath") or "", source_host=source_host
+            )
             if snap_path != target_path:
                 continue
         matched.append(sf)
@@ -634,8 +651,11 @@ def group_snapshots_by_origin(snapshot_files: list[Path]) -> dict[tuple, list[Pa
     for sf in snapshot_files:
         meta = read_snapshot_meta(sf)
         raw_path = meta.get("sourceProjectPath") or ""
-        norm_path = os.path.normpath(raw_path) if raw_path else ""
-        key = (meta.get("sourceHost"), norm_path)
+        host = meta.get("sourceHost")
+        norm_path = (
+            paths.normalize_origin_path(raw_path, source_host=host) if raw_path else ""
+        )
+        key = (host, norm_path)
         groups.setdefault(key, []).append(sf)
     return groups
 
@@ -681,8 +701,12 @@ def reject_cross_origin_import(
                 f"but snapshot belongs to {snapshot_host or 'unknown host'}"
             )
         if target_project_path is not None:
-            target_path = os.path.normpath(target_project_path)
-            snap_path = os.path.normpath(snapshot_project_path or "")
+            target_path = paths.normalize_origin_path(
+                target_project_path, source_host=target_host
+            )
+            snap_path = paths.normalize_origin_path(
+                snapshot_project_path or "", source_host=target_host
+            )
             if snap_path != target_path:
                 return (
                     f"ERROR: target workspace is {target_host}:{target_path}, "

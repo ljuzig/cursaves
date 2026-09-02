@@ -3,6 +3,7 @@
 import json
 import os
 import platform
+import posixpath
 import re
 import subprocess
 import sys
@@ -498,12 +499,13 @@ def find_all_matching_workspaces(
     source_basename = os.path.basename(source_normalized)
 
     if source_host:
+        source_normalized = normalize_origin_path(source_path, source_host=source_host)
         matches = [
             ws
             for ws in all_ws
             if ws.get("type") == "ssh"
             and ws.get("host") == source_host
-            and os.path.normpath(ws["path"]) == source_normalized
+            and normalize_origin_path(ws["path"], source_host=source_host) == source_normalized
         ]
         matches.sort(key=lambda w: w.get("mtime", 0), reverse=True)
         return matches
@@ -557,6 +559,32 @@ def format_workspace_display(ws: dict, include_path: bool = True) -> str:
 # ── Project identification ────────────────────────────────────────────
 
 
+def normalize_origin_path(project_path: str, *, source_host: Optional[str] = None) -> str:
+    """Normalize a project path for origin identity.
+
+    SSH remote paths belong to the remote host and are POSIX even when
+    cursaves runs on another platform. Local paths use local semantics.
+    """
+    if source_host:
+        return posixpath.normpath(project_path)
+    return os.path.normpath(project_path)
+
+
+def get_cache_dir() -> Path:
+    """Regenerable local cache (semantic fingerprints). Not in the git repo.
+
+    Linux: ``$XDG_CACHE_HOME/cursaves`` or ``~/.cache/cursaves``.
+    macOS: ``~/Library/Caches/cursaves``.
+    """
+    system = platform.system()
+    if system == "Darwin":
+        return Path.home() / "Library" / "Caches" / "cursaves"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg) / "cursaves"
+    return Path.home() / ".cache" / "cursaves"
+
+
 def get_project_identifier(
     project_path: str,
     source_host: Optional[str] = None,
@@ -576,7 +604,7 @@ def get_project_identifier(
     set, identity is derived from host + normalized remote path instead.
     """
     if source_host:
-        normalized_path = os.path.normpath(project_path)
+        normalized_path = normalize_origin_path(project_path, source_host=source_host)
         return _sanitize_identifier(f"ssh/{source_host}/{normalized_path}")
 
     remote_url = _get_git_remote_url(project_path)
