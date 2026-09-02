@@ -292,8 +292,9 @@ Note: "Developer: Reload Window" is not sufficient -- it reloads the renderer bu
 
 ## Safety
 
-- **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) work on a temporary copy of the database. They never touch Cursor's files and are safe to run while Cursor is open.
+- **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) snapshot Cursor's live SQLite via the Online Backup API, then read the copy. Safe to run while Cursor is open.
 - **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while the Cursor desktop app is detected as running (macOS and Linux). Use `--force` to override (not recommended).
+- Concurrent cursaves processes on the same machine serialize Cursor DB writes and local `~/.cursaves` snapshot-tree/backend work with advisory flocks under `~/.config/cursaves/` (`sqlite-write.lock`, `repo.lock`). This does not lock Git or S3 across machines. If another local process holds a lock, the command prints that it is waiting (up to 2 minutes by default) and exits with an error on timeout. Lock files are never deleted; the kernel drops a held flock when the process exits.
 - Snapshots are self-contained JSON -- even if import goes wrong, you always have the raw data and the backup.
 
 ## Privacy Warning

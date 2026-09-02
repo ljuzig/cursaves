@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from . import db, paths
+from . import db, dblock, paths
 
 
 def get_workspace_conversations(
@@ -512,6 +512,11 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
 
     Returns the path to the saved file.
     """
+    with dblock.repo_lock():
+        return _save_snapshot_unlocked(snapshot, snapshots_dir)
+
+
+def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
     # Organise by project identifier (git remote URL or directory name)
     project_id = snapshot.get("projectIdentifier")
     if not project_id:
@@ -609,6 +614,23 @@ def checkpoint_project(
     """
     snapshots_dir = paths.get_snapshots_dir()
 
+    with dblock.repo_lock():
+        return _checkpoint_project_unlocked(
+            project_path,
+            snapshots_dir,
+            composer_ids=composer_ids,
+            workspace_dir=workspace_dir,
+            source_host=source_host,
+        )
+
+
+def _checkpoint_project_unlocked(
+    project_path: str,
+    snapshots_dir: Path,
+    composer_ids: Optional[list[str]] = None,
+    workspace_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
+) -> list[Path]:
     t0 = time.time()
     print("  Fetching workspace conversations...", file=sys.stderr, flush=True)
     conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)

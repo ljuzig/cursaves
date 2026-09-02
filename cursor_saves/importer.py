@@ -159,6 +159,9 @@ def _init_workspace_db(db_path: Path):
     """Create a minimal state.vscdb with the required tables."""
     import sqlite3
 
+    from . import dblock
+
+    dblock.acquire_write_lock()
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value BLOB)")
     conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT UNIQUE, value BLOB)")

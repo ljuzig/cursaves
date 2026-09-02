@@ -443,7 +443,8 @@ Both databases use SQLite 3 with WAL (Write-Ahead Logging) mode. This means:
 - The main `.vscdb` file may not contain the most recent data
 - A `-wal` file alongside it contains uncommitted writes
 - A `-shm` file is used for shared memory coordination
-- To read consistent data, you should copy all three files (`.vscdb`, `-wal`, `-shm`) together
+- Copying only the main `.vscdb` file can miss recent WAL writes
+- cursaves uses SQLite's Online Backup API (`Connection.backup()`) for a consistent standalone snapshot, instead of copying the three files together
 
 The databases have two tables:
 
