@@ -696,12 +696,11 @@ def test_push_w_and_pull_w_agree_on_ssh_identity(tmp_path, monkeypatch):
         )
         return [tmp_path / "fake.json.gz"]
 
-    def fake_import_all(
+    def fake_run_pull(
         project_path,
-        snapshots_dir=None,
-        force=False,
         target_workspace_dir=None,
         source_host=None,
+        **_kwargs,
     ):
         captured_pull["project_path"] = project_path
         captured_pull["target_workspace_dir"] = target_workspace_dir
@@ -709,7 +708,8 @@ def test_push_w_and_pull_w_agree_on_ssh_identity(tmp_path, monkeypatch):
         captured_pull["project_id"] = paths.get_project_identifier(
             project_path, source_host=source_host
         )
-        return 1, 0
+        from cursor_saves.pull import PullResult
+        return PullResult(imported=1)
 
     monkeypatch.setattr(cli, "_require_sync_repo", lambda: tmp_path)
     monkeypatch.setattr(cli, "get_backend", lambda: _NoRemote())
@@ -721,7 +721,7 @@ def test_push_w_and_pull_w_agree_on_ssh_identity(tmp_path, monkeypatch):
         "type": "ssh",
     })
     monkeypatch.setattr(export, "checkpoint_project", fake_checkpoint)
-    monkeypatch.setattr(cli, "import_all_snapshots", fake_import_all)
+    monkeypatch.setattr(cli.pull, "run_workspace_pull", fake_run_pull)
     monkeypatch.setattr(cli, "_maybe_reload", lambda _args: None)
 
     cli.cmd_push(argparse.Namespace(
@@ -736,6 +736,7 @@ def test_push_w_and_pull_w_agree_on_ssh_identity(tmp_path, monkeypatch):
         project=None,
         select=False,
         force=True,
+        restore_all=False,
     ))
 
     assert captured_push == {

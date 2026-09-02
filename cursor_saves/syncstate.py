@@ -77,6 +77,18 @@ class OpCounts:
     cursor_write_connections: int = 0
     local_semantic_rehashes: int = 0
     local_inventory_json_parses: int = 0
+    pull_target_scans: int = 0
+    pull_candidates: int = 0
+    staged_snapshots: int = 0
+    safety_global_backups: int = 0
+    safety_workspace_backups: int = 0
+    write_connections_opened: int = 0
+    imports_attempted: int = 0
+    imports_completed: int = 0
+    cursor_running_checks: int = 0
+    snapshot_content_hashes: int = 0
+    local_guard_checks: int = 0
+    local_guard_skips: int = 0
 
 
 _counts = OpCounts()
@@ -311,6 +323,7 @@ def snapshot_content_digest(
     snapshot_path: Path, meta: Optional[dict] = None
 ) -> str:
     """Hash on-disk compressed bytes of main + shards. No decompress or JSON."""
+    _counts.snapshot_content_hashes += 1
     hasher = hashlib.sha256()
     for path in importer.snapshot_component_files(snapshot_path, meta):
         _hash_file_field(hasher, path.name.encode("utf-8"), path)
@@ -470,44 +483,70 @@ class SnapshotIndex:
     cache: SemanticsCache = field(default_factory=SemanticsCache)
 
     @classmethod
-    def build(cls, snapshots_dir: Optional[Path] = None) -> "SnapshotIndex":
+    def build(
+        cls,
+        snapshots_dir: Optional[Path] = None,
+        project_identifier: Optional[str] = None,
+    ) -> "SnapshotIndex":
         _counts.snapshot_directory_scans += 1
+        if project_identifier:
+            _counts.pull_target_scans += 1
         root = snapshots_dir if snapshots_dir is not None else paths.get_snapshots_dir()
         index = cls()
         if not root.exists():
             return index
-        for project_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-            for snap_path in importer.list_snapshot_files(project_dir):
-                stem = snap_path.name
-                if stem.endswith(".json.gz"):
-                    stem = stem[: -len(".json.gz")]
-                elif stem.endswith(".json"):
-                    stem = stem[: -len(".json")]
-                meta_path = snap_path.parent / f"{stem}.meta.json"
-                meta: dict = {}
-                if meta_path.exists():
-                    try:
-                        meta = json.loads(meta_path.read_text())
-                    except (json.JSONDecodeError, OSError):
-                        meta = {}
-                cid = meta.get("composerId") or stem
-                if not cid:
-                    continue
-                project_id = project_dir.name
-                meta_project_id = meta.get("projectIdentifier")
-                invalid_origin = bool(meta_project_id and meta_project_id != project_id)
-                identity = snapshot_source_identity(snap_path, meta)
-                rec = SnapshotRecord(
-                    composer_id=cid,
-                    path=snap_path,
-                    meta=meta,
-                    project_dir=project_dir,
-                    project_identifier=project_id,
-                    identity=identity,
-                    invalid_origin=invalid_origin,
-                )
-                index.by_key[(project_id, cid)] = rec
+        if project_identifier:
+            project_dir = root / project_identifier
+            dirs = [project_dir] if project_dir.is_dir() else []
+        else:
+            dirs = sorted(p for p in root.iterdir() if p.is_dir())
+        for project_dir in dirs:
+            index._index_project_dir(project_dir)
         return index
+
+    @classmethod
+    def build_for_project(
+        cls,
+        project_identifier: str,
+        snapshots_dir: Optional[Path] = None,
+    ) -> "SnapshotIndex":
+        """Index only ``snapshots/<project_identifier>/``."""
+        return cls.build(
+            snapshots_dir=snapshots_dir,
+            project_identifier=project_identifier,
+        )
+
+    def _index_project_dir(self, project_dir: Path) -> None:
+        for snap_path in importer.list_snapshot_files(project_dir):
+            stem = snap_path.name
+            if stem.endswith(".json.gz"):
+                stem = stem[: -len(".json.gz")]
+            elif stem.endswith(".json"):
+                stem = stem[: -len(".json")]
+            meta_path = snap_path.parent / f"{stem}.meta.json"
+            meta: dict = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    meta = {}
+            cid = meta.get("composerId") or stem
+            if not cid:
+                continue
+            project_id = project_dir.name
+            meta_project_id = meta.get("projectIdentifier")
+            invalid_origin = bool(meta_project_id and meta_project_id != project_id)
+            identity = snapshot_source_identity(snap_path, meta)
+            rec = SnapshotRecord(
+                composer_id=cid,
+                path=snap_path,
+                meta=meta,
+                project_dir=project_dir,
+                project_identifier=project_id,
+                identity=identity,
+                invalid_origin=invalid_origin,
+            )
+            self.by_key[(project_id, cid)] = rec
 
     def get(
         self,
@@ -1059,3 +1098,513 @@ def build_sync_plan(
     index.cache.flush()
     session.cache.flush()
     return plan
+
+
+class PullRelation(str, Enum):
+    """Target-scoped pull classification. Not used by ``sync``."""
+
+    MISSING_LOCAL = "missing_local"
+    GLOBAL_COLLISION = "global_collision"
+    UP_TO_DATE = "up_to_date"
+    BEHIND = "behind"
+    LOCAL_AHEAD = "local_ahead"
+    DIVERGED = "diverged"
+    UNKNOWN = "unknown"
+    NEVER_PUSHED = "never_pushed"
+
+
+class PullAction(str, Enum):
+    IMPORT = "import"
+    SKIP = "skip"
+
+
+@dataclass
+class LocalGuard:
+    """Preflight snapshot of local Cursor state for one import candidate."""
+
+    expect_present: bool
+    expect_in_target: bool
+    row_fingerprint: str = ""
+    blob_refs: list[str] = field(default_factory=list)
+    blob_fingerprint: str = ""
+
+
+_SYNC_TO_PULL = {
+    SyncRelation.UP_TO_DATE: PullRelation.UP_TO_DATE,
+    SyncRelation.BEHIND: PullRelation.BEHIND,
+    SyncRelation.LOCAL_AHEAD: PullRelation.LOCAL_AHEAD,
+    SyncRelation.DIVERGED: PullRelation.DIVERGED,
+    SyncRelation.UNKNOWN: PullRelation.UNKNOWN,
+    SyncRelation.NEVER_PUSHED: PullRelation.NEVER_PUSHED,
+}
+
+
+@dataclass
+class PullItem:
+    composer_id: str
+    relation: PullRelation
+    action: PullAction = PullAction.SKIP
+    name: str = ""
+    snapshot_path: Optional[Path] = None
+    staged_path: Optional[Path] = None
+    meta: dict = field(default_factory=dict)
+    workspace_dir: Optional[Path] = None
+    project_path: str = ""
+    source_host: Optional[str] = None
+    project_identifier: str = ""
+    classified_identity: tuple = ()
+    classified_content_digest: str = ""
+    local_guard: Optional[LocalGuard] = None
+
+
+@dataclass
+class PullPlan:
+    items: list[PullItem] = field(default_factory=list)
+    never_pushed: int = 0
+    restore_all: bool = False
+
+    def by_relation(self, relation: PullRelation) -> list[PullItem]:
+        return [i for i in self.items if i.relation == relation]
+
+    @property
+    def import_candidates(self) -> list[PullItem]:
+        return [i for i in self.items if i.action == PullAction.IMPORT]
+
+    @property
+    def synced(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.UP_TO_DATE)
+
+    @property
+    def behind(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.BEHIND)
+
+    @property
+    def ahead(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.LOCAL_AHEAD)
+
+    @property
+    def missing_local(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.MISSING_LOCAL)
+
+    @property
+    def diverged(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.DIVERGED)
+
+    @property
+    def unknown(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.UNKNOWN)
+
+    @property
+    def collisions(self) -> list[PullItem]:
+        return self.by_relation(PullRelation.GLOBAL_COLLISION)
+
+
+def _pull_action(relation: PullRelation, restore_all: bool) -> PullAction:
+    if relation in (
+        PullRelation.DIVERGED,
+        PullRelation.UNKNOWN,
+        PullRelation.NEVER_PUSHED,
+        PullRelation.GLOBAL_COLLISION,
+    ):
+        return PullAction.SKIP
+    if restore_all and relation in (
+        PullRelation.MISSING_LOCAL,
+        PullRelation.BEHIND,
+        PullRelation.UP_TO_DATE,
+        PullRelation.LOCAL_AHEAD,
+    ):
+        return PullAction.IMPORT
+    if relation in (PullRelation.MISSING_LOCAL, PullRelation.BEHIND):
+        return PullAction.IMPORT
+    return PullAction.SKIP
+
+
+def _record_matches_target(rec: SnapshotRecord, workspace: dict) -> bool:
+    """Origin filter: host + normalized path before any semantic compare."""
+    host = workspace.get("host")
+    path = workspace.get("path") or ""
+    if rec.invalid_origin:
+        return True
+    if host:
+        if rec.meta.get("sourceHost") != host:
+            return False
+        snap_path = rec.meta.get("sourceProjectPath") or ""
+        if path and paths.normalize_origin_path(
+            snap_path, source_host=host
+        ) != paths.normalize_origin_path(path, source_host=host):
+            return False
+        return True
+    if rec.meta.get("sourceHost"):
+        return False
+    return True
+
+
+def _target_workspace_composer_ids(workspace: dict) -> set[str]:
+    ws_dir = workspace.get("workspace_dir")
+    if not ws_dir:
+        return set()
+    ws_db = Path(ws_dir) / "state.vscdb"
+    if not ws_db.exists():
+        return set()
+    return set(paths.get_workspace_composer_ids(ws_db))
+
+
+def _global_has_composer(session: SyncReadSession, composer_id: str) -> bool:
+    """True if the global Cursor DB already has this composer.
+
+    Presence only — never used to classify semantics against another
+    workspace. Fail closed if the inventory is incomplete.
+    """
+    if session.cdb is None:
+        return False
+    if session._inventory_complete:
+        return session.raw_fingerprint(composer_id) is not None
+    try:
+        return session.composer_data(composer_id) is not None
+    except Exception:
+        return True
+
+
+def _candidate_content_digest(rec: SnapshotRecord) -> str:
+    """Identity of bytes we are about to stage. Hash only when needed."""
+    sidecar = rec.meta.get("snapshotContentDigest")
+    if isinstance(sidecar, str) and sidecar:
+        return sidecar
+    return snapshot_content_digest(rec.path, rec.meta)
+
+
+def capture_local_guard(
+    session: SyncReadSession,
+    composer_id: str,
+    *,
+    expect_present: bool,
+    expect_in_target: bool,
+) -> Optional[LocalGuard]:
+    """Record the local source identity seen during preflight.
+
+    For a present conversation this reuses Commit 4 fingerprints. Returns
+    None if a present chat cannot be fingerprinted (fail closed).
+    """
+    if not expect_present:
+        return LocalGuard(expect_present=False, expect_in_target=expect_in_target)
+    row_fp = session.raw_fingerprint(composer_id)
+    if not row_fp:
+        return None
+    cached = session.cache.get_local(composer_id)
+    if cached and cached.get("rowFingerprint") == row_fp:
+        return LocalGuard(
+            expect_present=True,
+            expect_in_target=expect_in_target,
+            row_fingerprint=row_fp,
+            blob_refs=list(cached.get("blobRefs") or []),
+            blob_fingerprint=cached.get("blobFingerprint") or "",
+        )
+    try:
+        session.local_unit_hashes(composer_id)
+    except ClassifyError:
+        return None
+    cached = session.cache.get_local(composer_id)
+    if not cached or cached.get("rowFingerprint") != row_fp:
+        return None
+    return LocalGuard(
+        expect_present=True,
+        expect_in_target=expect_in_target,
+        row_fingerprint=row_fp,
+        blob_refs=list(cached.get("blobRefs") or []),
+        blob_fingerprint=cached.get("blobFingerprint") or "",
+    )
+
+
+def _live_select_value(cdb: "db.CursorDB", key: str, table: str) -> Optional[Any]:
+    """Return the live cell, or None if the key is absent. SQL errors propagate."""
+    conn = cdb._reader_conn()
+    row = conn.execute(
+        f"SELECT value FROM {table} WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
+def _live_select_json(cdb: "db.CursorDB", key: str, table: str) -> Optional[Any]:
+    """Parse a live JSON cell. Absent key → None. Corrupt/SQL errors propagate."""
+    raw = _live_select_value(cdb, key, table)
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return json.loads(raw)
+
+
+def _live_row_fingerprint(cdb: "db.CursorDB", composer_id: str) -> Optional[str]:
+    """Hash live composer + bubble rows. None only if the composer row is absent."""
+    conn = cdb._reader_conn()
+    row = conn.execute(
+        "SELECT value FROM cursorDiskKV WHERE key = ?",
+        (f"composerData:{composer_id}",),
+    ).fetchone()
+    if row is None:
+        return None
+    hasher = hashlib.sha256()
+    _hash_field(
+        hasher,
+        f"composerData:{composer_id}".encode("utf-8"),
+        _as_bytes(row[0]),
+    )
+    bubbles = conn.execute(
+        "SELECT key, value FROM cursorDiskKV "
+        "WHERE key LIKE ? ORDER BY key",
+        (f"bubbleId:{composer_id}:%",),
+    )
+    for key, val in bubbles:
+        _hash_field(hasher, key.encode("utf-8") if isinstance(key, str) else key, _as_bytes(val))
+    return "sha256:" + hasher.hexdigest()
+
+
+def _live_blob_fingerprint(cdb: "db.CursorDB", refs: list[str]) -> str:
+    hasher = hashlib.sha256()
+    for ref in refs:
+        val = _live_select_value(cdb, f"composer.content.{ref}", "cursorDiskKV")
+        _hash_field(
+            hasher,
+            ref.encode("utf-8"),
+            _as_bytes(val) if val is not None else b"\0missing",
+        )
+    return "sha256:" + hasher.hexdigest()
+
+
+def _live_target_has_composer(
+    workspace_cdb: "db.CursorDB",
+    global_cdb: "db.CursorDB",
+    composer_id: str,
+    workspace_dir: Optional[Path],
+) -> bool:
+    data = _live_select_json(workspace_cdb, "composer.composerData", "ItemTable")
+    if isinstance(data, dict):
+        for entry in data.get("allComposers") or []:
+            if isinstance(entry, dict) and entry.get("composerId") == composer_id:
+                return True
+        for field in ("selectedComposerIds", "lastFocusedComposerIds"):
+            ids = data.get(field) or []
+            if composer_id in ids:
+                return True
+    if workspace_dir is None:
+        return False
+    headers = _live_select_json(global_cdb, "composer.composerHeaders", "ItemTable")
+    if not isinstance(headers, dict):
+        return False
+    ws_hash = Path(workspace_dir).name
+    for entry in headers.get("allComposers") or []:
+        if not isinstance(entry, dict) or entry.get("composerId") != composer_id:
+            continue
+        wi = entry.get("workspaceIdentifier") or {}
+        if wi.get("id") == ws_hash:
+            return True
+    return False
+
+
+def local_guard_still_matches(
+    item: "PullItem",
+    global_cdb: "db.CursorDB",
+    workspace_cdb: "db.CursorDB",
+) -> bool:
+    """True if live Cursor state still matches the preflight guard.
+
+    A read error is a mismatch, never an inferred absence.
+    """
+    _counts.local_guard_checks += 1
+    guard = item.local_guard
+    if guard is None:
+        return False
+    try:
+        live_fp = _live_row_fingerprint(global_cdb, item.composer_id)
+        present = live_fp is not None
+        if present != guard.expect_present:
+            return False
+        in_target = _live_target_has_composer(
+            workspace_cdb, global_cdb, item.composer_id, item.workspace_dir
+        )
+        if in_target != guard.expect_in_target:
+            return False
+        if not guard.expect_present:
+            return True
+        if live_fp != guard.row_fingerprint:
+            return False
+        if _live_blob_fingerprint(global_cdb, guard.blob_refs) != guard.blob_fingerprint:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def build_pull_plan(
+    session: SyncReadSession,
+    index: SnapshotIndex,
+    target_workspace: dict,
+    *,
+    restore_all: bool = False,
+    selected_paths: Optional[list[Path]] = None,
+) -> PullPlan:
+    """Classify snapshots for one pull target. Does not walk other workspaces.
+
+    Local presence is the target workspace's composer IDs only. A CID that
+    exists in the global Cursor DB but not in the target is a collision:
+    importing it would overwrite the other workspace's conversation.
+    """
+    plan = PullPlan(restore_all=restore_all)
+    session.cache = index.cache
+    selected = {p.resolve() for p in selected_paths} if selected_paths else None
+    target_ids = _target_workspace_composer_ids(target_workspace)
+    snapshot_cids: set[str] = set()
+    ws_dir = target_workspace.get("workspace_dir")
+    project_path = target_workspace.get("path") or ""
+    source_host = target_workspace.get("host")
+
+    for rec in index.by_key.values():
+        if selected is not None and rec.path.resolve() not in selected:
+            continue
+        if not _record_matches_target(rec, target_workspace):
+            continue
+        snapshot_cids.add(rec.composer_id)
+
+        if rec.invalid_origin:
+            relation = PullRelation.UNKNOWN
+        elif rec.composer_id not in target_ids:
+            if _global_has_composer(session, rec.composer_id):
+                relation = PullRelation.GLOBAL_COLLISION
+            else:
+                try:
+                    index.ensure_remote_readable(rec)
+                except ClassifyError:
+                    relation = PullRelation.UNKNOWN
+                else:
+                    relation = PullRelation.MISSING_LOCAL
+        else:
+            try:
+                sync_rel = classify_conversation(
+                    session,
+                    index,
+                    rec.composer_id,
+                    project_identifier=rec.project_identifier,
+                    source_host=source_host,
+                    source_path=project_path,
+                    workspace=target_workspace,
+                )
+            except ClassifyError:
+                sync_rel = SyncRelation.UNKNOWN
+            relation = _SYNC_TO_PULL.get(sync_rel, PullRelation.UNKNOWN)
+
+        action = _pull_action(relation, restore_all)
+        content_digest = ""
+        local_guard = None
+        if action == PullAction.IMPORT:
+            try:
+                content_digest = _candidate_content_digest(rec)
+            except OSError:
+                relation = PullRelation.UNKNOWN
+                action = PullAction.SKIP
+        if action == PullAction.IMPORT:
+            present = relation != PullRelation.MISSING_LOCAL
+            local_guard = capture_local_guard(
+                session,
+                rec.composer_id,
+                expect_present=present,
+                expect_in_target=present,
+            )
+            if local_guard is None:
+                relation = PullRelation.UNKNOWN
+                action = PullAction.SKIP
+
+        item = PullItem(
+            composer_id=rec.composer_id,
+            relation=relation,
+            action=action,
+            name=rec.meta.get("name") or "Untitled",
+            snapshot_path=rec.path,
+            meta=rec.meta,
+            workspace_dir=ws_dir,
+            project_path=project_path,
+            source_host=source_host,
+            project_identifier=rec.project_identifier,
+            classified_identity=rec.identity,
+            classified_content_digest=content_digest,
+            local_guard=local_guard,
+        )
+        plan.items.append(item)
+
+    plan.never_pushed = len(target_ids - snapshot_cids)
+    _counts.pull_candidates += len(plan.import_candidates)
+    index.cache.flush()
+    session.cache.flush()
+    return plan
+
+
+def stage_import_candidates(plan: PullPlan, staging_dir: Path) -> list[PullItem]:
+    """Copy only import candidates (main + shards + sidecar) under *staging_dir*.
+
+    Verifies the source identity is unchanged and the staged bytes match
+    the classified ``snapshotContentDigest``. A mismatch becomes UNKNOWN.
+    """
+    import shutil
+
+    staged: list[PullItem] = []
+    for item in list(plan.import_candidates):
+        if item.snapshot_path is None:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+        try:
+            current_identity = snapshot_source_identity(item.snapshot_path, item.meta)
+        except OSError:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+        if item.classified_identity and current_identity != item.classified_identity:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+
+        dest_dir = staging_dir / item.project_identifier / item.composer_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        components = importer.snapshot_component_files(item.snapshot_path, item.meta)
+        if not components:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+        try:
+            for src in components:
+                shutil.copy2(src, dest_dir / src.name)
+            sidecar = importer.snapshot_sidecar_path(item.snapshot_path)
+            if sidecar.exists():
+                shutil.copy2(sidecar, dest_dir / sidecar.name)
+        except OSError:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+
+        staged_main = dest_dir / item.snapshot_path.name
+        try:
+            staged_digest = snapshot_content_digest(staged_main, item.meta)
+        except OSError:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+        if item.classified_content_digest and staged_digest != item.classified_content_digest:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+        try:
+            if snapshot_source_identity(item.snapshot_path, item.meta) != current_identity:
+                item.action = PullAction.SKIP
+                item.relation = PullRelation.UNKNOWN
+                continue
+        except OSError:
+            item.action = PullAction.SKIP
+            item.relation = PullRelation.UNKNOWN
+            continue
+
+        item.staged_path = staged_main
+        _counts.staged_snapshots += 1
+        staged.append(item)
+    return staged
