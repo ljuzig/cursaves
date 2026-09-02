@@ -91,8 +91,10 @@ class CursorDB:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
+        self.autocommit = True
         self._tmp_path: Optional[Path] = None
         self._conn: Optional[sqlite3.Connection] = None
+        self._write_conn: Optional[sqlite3.Connection] = None
 
     def _ensure_read_copy(self) -> sqlite3.Connection:
         """Copy the database to a temp file and open a read-only connection."""
@@ -132,9 +134,15 @@ class CursorDB:
 
     # ── Read operations (on temp copy) ──────────────────────────────
 
+    def _reader_conn(self) -> sqlite3.Connection:
+        """Prefer the live write connection during a batched import."""
+        if not self.autocommit and self._write_conn is not None:
+            return self._write_conn
+        return self._ensure_read_copy()
+
     def get_item(self, key: str, table: str = "ItemTable") -> Optional[str]:
         """Get a value from the key-value store."""
-        conn = self._ensure_read_copy()
+        conn = self._reader_conn()
         try:
             row = conn.execute(
                 f"SELECT value FROM {table} WHERE key = ?", (key,)
@@ -150,7 +158,7 @@ class CursorDB:
 
     def get_item_binary(self, key: str, table: str = "ItemTable") -> Optional[bytes]:
         """Get a raw binary value from the key-value store."""
-        conn = self._ensure_read_copy()
+        conn = self._reader_conn()
         try:
             row = conn.execute(
                 f"SELECT value FROM {table} WHERE key = ?", (key,)
@@ -170,7 +178,7 @@ class CursorDB:
 
     def list_keys(self, prefix: str = "", table: str = "cursorDiskKV") -> list[str]:
         """List all keys in a table, optionally filtered by prefix."""
-        conn = self._ensure_read_copy()
+        conn = self._reader_conn()
         try:
             if prefix:
                 rows = conn.execute(
@@ -192,7 +200,7 @@ class CursorDB:
 
         Uses a single SQL query — efficient even on large databases.
         """
-        conn = self._ensure_read_copy()
+        conn = self._reader_conn()
         result: dict[str, int] = {}
         try:
             prefix = key_type + ":"
@@ -224,7 +232,7 @@ class CursorDB:
 
     def close_write(self) -> None:
         """Close the write connection on the original database, if any."""
-        conn = getattr(self, "_write_conn", None)
+        conn = self._write_conn
         if conn is not None:
             conn.close()
             self._write_conn = None
@@ -233,10 +241,38 @@ class CursorDB:
     def _get_write_conn(self) -> sqlite3.Connection:
         """Get or create a connection for write operations on the ORIGINAL database."""
         dblock.acquire_write_lock()
-        if not hasattr(self, "_write_conn") or self._write_conn is None:
+        if self._write_conn is None:
             self._write_conn = sqlite3.connect(str(self.db_path))
             _write_owners.add(self)
+            from . import syncstate
+
+            syncstate._counts.cursor_write_connections += 1
+            syncstate._counts.write_connections_opened += 1
         return self._write_conn
+
+    def enable_batch_writes(self) -> None:
+        """Disable per-call commits so a caller can use savepoints."""
+        self.autocommit = False
+        conn = self._get_write_conn()
+        conn.isolation_level = None
+
+    def begin(self) -> None:
+        self._get_write_conn().execute("BEGIN")
+
+    def commit_write(self) -> None:
+        self._get_write_conn().execute("COMMIT")
+
+    def rollback_write(self) -> None:
+        self._get_write_conn().execute("ROLLBACK")
+
+    def savepoint(self, name: str) -> None:
+        self._get_write_conn().execute(f"SAVEPOINT {name}")
+
+    def release_savepoint(self, name: str) -> None:
+        self._get_write_conn().execute(f"RELEASE SAVEPOINT {name}")
+
+    def rollback_to_savepoint(self, name: str) -> None:
+        self._get_write_conn().execute(f"ROLLBACK TO SAVEPOINT {name}")
 
     def write_item(self, key: str, value: str, table: str = "ItemTable"):
         """Write a value to the key-value store on the ORIGINAL database.
@@ -249,7 +285,8 @@ class CursorDB:
             f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
             (key, value),
         )
-        conn.commit()
+        if self.autocommit:
+            conn.commit()
 
     def write_disk_kv(self, key: str, value: str):
         """Write a value to cursorDiskKV on the ORIGINAL database."""
@@ -266,16 +303,22 @@ class CursorDB:
         connection and one transaction for all items.
         """
         conn = self._get_write_conn()
-        conn.execute("BEGIN")
-        try:
-            conn.executemany(
-                f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
-                items,
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        if self.autocommit:
+            conn.execute("BEGIN")
+            try:
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
+                    items,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            return
+        conn.executemany(
+            f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
+            items,
+        )
 
     def write_json_batch(self, items: list[tuple[str, Any]], table: str = "cursorDiskKV"):
         """Write multiple JSON key-value pairs in a single transaction."""
@@ -293,21 +336,31 @@ class CursorDB:
         if not keys:
             return 0
         conn = self._get_write_conn()
-        conn.execute("BEGIN")
-        try:
-            total = 0
-            for batch_start in range(0, len(keys), 500):
-                batch = keys[batch_start:batch_start + 500]
-                placeholders = ",".join("?" for _ in batch)
-                cur = conn.execute(
-                    f"DELETE FROM {table} WHERE key IN ({placeholders})", batch
-                )
-                total += cur.rowcount
-            conn.execute("COMMIT")
-            return total
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        if self.autocommit:
+            conn.execute("BEGIN")
+            try:
+                total = 0
+                for batch_start in range(0, len(keys), 500):
+                    batch = keys[batch_start:batch_start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    cur = conn.execute(
+                        f"DELETE FROM {table} WHERE key IN ({placeholders})", batch
+                    )
+                    total += cur.rowcount
+                conn.execute("COMMIT")
+                return total
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        total = 0
+        for batch_start in range(0, len(keys), 500):
+            batch = keys[batch_start:batch_start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE key IN ({placeholders})", batch
+            )
+            total += cur.rowcount
+        return total
 
     def delete_keys_by_prefix(self, prefix: str, table: str = "cursorDiskKV") -> int:
         """Delete all keys matching a prefix on the ORIGINAL database.
@@ -318,7 +371,8 @@ class CursorDB:
         cur = conn.execute(
             f"DELETE FROM {table} WHERE key LIKE ?", (prefix + "%",)
         )
-        conn.commit()
+        if self.autocommit:
+            conn.commit()
         return cur.rowcount
 
 

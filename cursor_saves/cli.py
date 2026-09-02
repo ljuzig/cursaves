@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, db, dblock, export, paths, syncstate
+from . import __version__, db, dblock, export, paths, pull, syncstate
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
     copy_between_workspaces,
@@ -1155,165 +1155,142 @@ def _backend_pull() -> bool:
         return False
 
 
-def cmd_pull(args):
-    """Pull + import snapshots in one command."""
-    sync_dir = _require_sync_repo()
+def _cmd_pull_select(args, *, force: bool, restore_all: bool) -> None:
+    """Interactive pull: classify selected snapshots, then batch-import."""
+    from .interactive import select_one, select_snapshots
 
-    # Step 1: Pull from remote
+    projects = list_snapshot_projects()
+    if not projects:
+        print("No snapshots found. Run 'cursaves push' on another machine first.")
+        return
+
+    project_choices = []
+    for p in projects:
+        sources = ", ".join(sorted(p["sources"])) or "unknown"
+        last_saved = p.get("latest_export", "")[:16] or "unknown"
+        display = f"{p['name']:<30} {p['count']:>3} chats  {last_saved}  from {sources}"
+        project_choices.append({"name": display, "_project": p})
+
+    selected_project = select_one(
+        project_choices, message="Select project to import from:"
+    )
+    if not selected_project:
+        return
+
+    project = selected_project["_project"]
+    snapshot_files = list_snapshot_files(project["path"])
+    snapshots_info = []
+    for sf in snapshot_files:
+        meta = read_snapshot_meta(sf)
+        source_host = meta.get("sourceHost")
+        snapshots_info.append({
+            "file": sf,
+            "composerId": meta.get("composerId"),
+            "name": meta.get("name") or "Untitled",
+            "msgs": meta.get("messageCount", 0),
+            "exported": (meta.get("exportedAt") or "")[:16] or "unknown",
+            "source": source_host or meta.get("sourceMachine") or "unknown",
+        })
+
+    if not snapshots_info:
+        print(f"  No snapshots in {project['name']}/")
+        return
+
+    selected_snaps = select_snapshots(snapshots_info)
+    if not selected_snaps:
+        return
+
+    selected_files = [s["file"] for s in selected_snaps]
+    origin_groups = group_snapshots_by_origin(selected_files)
+    if len(origin_groups) > 1:
+        print(
+            f"  Selected chats span {len(origin_groups)} SSH host/path "
+            f"origin(s); importing each group into its own workspace."
+        )
+
+    targets: list[tuple[dict, list[Path]]] = []
+    for (snap_host, snap_path), group_files in origin_groups.items():
+        origin_paths = {snap_path} if snap_path else set()
+        target_workspaces = _select_target_workspaces(
+            origin_paths, source_host=snap_host
+        )
+        action, target_workspaces = pull_select_import_plan(
+            snap_host, target_workspaces
+        )
+
+        if action == "skip":
+            print(
+                f"  No matching SSH workspace found for "
+                f"{snap_host}:{snap_path}; skipped."
+            )
+            continue
+
+        if action == "fallback":
+            cwd = os.getcwd()
+            cwd_basename = os.path.basename(os.path.normpath(cwd))
+            source_basenames = {
+                os.path.basename(os.path.normpath(sp)) for sp in origin_paths
+            }
+            if cwd_basename in source_basenames or project["name"] == paths.get_project_identifier(cwd):
+                target_path = cwd
+            else:
+                origin_label = (
+                    f"{snap_host}:{snap_path}" if snap_host else snap_path or "unknown"
+                )
+                print(f"  No matching workspaces found for {origin_label}.")
+                print("  Enter a local project path to import into (or press Enter to skip):")
+                try:
+                    target_path = input("  > ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if not target_path:
+                    print("  Skipped.")
+                    continue
+            workspace = pull.resolve_pull_workspace(target_path, source_host=snap_host)
+            targets.append((workspace, group_files))
+            continue
+
+        for ws in target_workspaces:
+            print(f"  Target: {paths.format_workspace_display(ws)}")
+            targets.append((ws, group_files))
+
+    if not targets:
+        print("\nNo snapshots imported.")
+        return
+
+    result = pull.run_multi_target_pull(
+        targets, force=force, restore_all=restore_all,
+    )
+    if result.imported > 0:
+        _maybe_reload(args)
+
+
+def cmd_pull(args):
+    """Pull + import only missing/behind snapshots (or --restore-all)."""
+    _require_sync_repo()
+
+    print("Pulling snapshots...")
     if not _backend_pull():
         return
 
-    # Step 2: Select what to import
+    restore_all = bool(getattr(args, "restore_all", False))
+    force = bool(getattr(args, "force", False))
+
     if args.select:
-        from .interactive import select_one, select_snapshots
+        _cmd_pull_select(args, force=force, restore_all=restore_all)
+        return
 
-        # Interactive: show available snapshot projects and let user pick
-        projects = list_snapshot_projects()
-        if not projects:
-            print("No snapshots found. Run 'cursaves push' on another machine first.")
-            return
-
-        # Select project with fuzzy search
-        project_choices = []
-        for p in projects:
-            sources = ", ".join(sorted(p["sources"])) or "unknown"
-            last_saved = p.get("latest_export", "")[:16] or "unknown"
-            display = f"{p['name']:<30} {p['count']:>3} chats  {last_saved}  from {sources}"
-            project_choices.append({"name": display, "_project": p})
-
-        selected_project = select_one(
-            project_choices, message="Select project to import from:"
-        )
-        if not selected_project:
-            return
-
-        total_success = 0
-        total_failure = 0
-        for project in [selected_project["_project"]]:
-            # Build snapshot list for this project
-            snapshot_files = list_snapshot_files(project["path"])
-            snapshots_info = []
-            for sf in snapshot_files:
-                meta = read_snapshot_meta(sf)
-                source_host = meta.get("sourceHost")
-                snapshots_info.append({
-                    "file": sf,
-                    "composerId": meta.get("composerId"),
-                    "name": meta.get("name") or "Untitled",
-                    "msgs": meta.get("messageCount", 0),
-                    "exported": (meta.get("exportedAt") or "")[:16] or "unknown",
-                    "source": source_host or meta.get("sourceMachine") or "unknown",
-                })
-
-            if not snapshots_info:
-                print(f"  No snapshots in {project['name']}/")
-                continue
-
-            # Interactive snapshot selection
-            selected_snaps = select_snapshots(snapshots_info)
-            if not selected_snaps:
-                continue
-
-            selected_files = [s["file"] for s in selected_snaps]
-            print(f"\n  Importing {len(selected_files)} chat(s) from {project['name']}/...")
-
-            origin_groups = group_snapshots_by_origin(selected_files)
-            if len(origin_groups) > 1:
-                print(
-                    f"  Selected chats span {len(origin_groups)} SSH host/path "
-                    f"origin(s); importing each group into its own workspace."
-                )
-
-            for (snap_host, snap_path), group_files in origin_groups.items():
-                origin_paths = {snap_path} if snap_path else set()
-                target_workspaces = _select_target_workspaces(
-                    origin_paths, source_host=snap_host
-                )
-                action, target_workspaces = pull_select_import_plan(
-                    snap_host, target_workspaces
-                )
-
-                if action == "skip":
-                    print(
-                        f"  No matching SSH workspace found for "
-                        f"{snap_host}:{snap_path}; skipped."
-                    )
-                    total_failure += len(group_files)
-                    continue
-
-                if action == "fallback":
-                    cwd = os.getcwd()
-                    cwd_basename = os.path.basename(os.path.normpath(cwd))
-                    source_basenames = {
-                        os.path.basename(os.path.normpath(sp)) for sp in origin_paths
-                    }
-                    if cwd_basename in source_basenames or project["name"] == paths.get_project_identifier(cwd):
-                        target_path = cwd
-                    else:
-                        origin_label = (
-                            f"{snap_host}:{snap_path}" if snap_host else snap_path or "unknown"
-                        )
-                        print(f"  No matching workspaces found for {origin_label}.")
-                        print(f"  Enter a local project path to import into (or press Enter to skip):")
-                        try:
-                            target_path = input("  > ").strip()
-                        except (EOFError, KeyboardInterrupt):
-                            print()
-                            continue
-                        if not target_path:
-                            print("  Skipped.")
-                            continue
-
-                    for sf in group_files:
-                        print(f"  Importing {sf.name}...")
-                        if import_snapshot(sf, target_path):
-                            total_success += 1
-                            print(f"    OK")
-                        else:
-                            total_failure += 1
-                            print(f"    FAILED")
-                else:
-                    for ws in target_workspaces:
-                        display = paths.format_workspace_display(ws)
-                        print(f"  Importing into: {display}")
-                        for sf in group_files:
-                            print(f"    {sf.name}...")
-                            if import_snapshot(sf, ws["path"], target_workspace_dir=ws["workspace_dir"]):
-                                total_success += 1
-                            else:
-                                total_failure += 1
-
-        if total_success == 0 and total_failure == 0:
-            print("\nNo snapshots imported.")
-            return
-
-        print(f"\nDone: {total_success} imported, {total_failure} failed.")
-        if total_success > 0:
-            _maybe_reload(args)
-    else:
-        # Non-interactive: import for the resolved project/workspace
-        project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
-        if workspace_dir:
-            print(f"Importing into workspace: {project_path}")
-            if source_host:
-                print(f"  SSH host: {source_host}")
-        else:
-            print(f"Importing snapshots for {project_path}...")
-
-        success, failure = import_all_snapshots(
-            project_path,
-            force=args.force,
-            target_workspace_dir=workspace_dir,
-            source_host=source_host,
-        )
-
-        if success == 0 and failure == 0:
-            print("No snapshots found to import.")
-            return
-
-        print(f"\nDone: {success} imported, {failure} failed.")
-        if success > 0:
-            _maybe_reload(args)
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
+    result = pull.run_workspace_pull(
+        project_path,
+        target_workspace_dir=workspace_dir,
+        source_host=source_host,
+        force=force,
+        restore_all=restore_all,
+    )
+    if result.imported > 0:
+        _maybe_reload(args)
 
 
 def cmd_watch(args):
@@ -1925,7 +1902,8 @@ def main():
 
     # ── pull ────────────────────────────────────────────────────────
     p_pull = subparsers.add_parser(
-        "pull", help="Git pull + import snapshots (one command to sync and restore)"
+        "pull",
+        help="Pull remote snapshots and import only missing or behind conversations",
     )
     p_pull.add_argument(
         "--workspace", "-w",
@@ -1938,7 +1916,11 @@ def main():
     )
     p_pull.add_argument(
         "--force", action="store_true",
-        help="Suppress the Cursor-running warning",
+        help="Write Cursor even if Cursor is running (does not override divergence)",
+    )
+    p_pull.add_argument(
+        "--restore-all", action="store_true",
+        help="Import every valid snapshot of this origin, including already synced and local-ahead chats",
     )
     p_pull.add_argument(
         "--reload", action="store_true",

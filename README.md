@@ -75,7 +75,7 @@ cursaves sync
 
 # Or manually:
 cursaves push              # save and push to remote
-cursaves pull              # pull and restore conversations
+cursaves pull              # pull behind/missing conversations only
 # Then restart Cursor (quit and reopen) to see the imported chats
 ```
 
@@ -90,7 +90,7 @@ cursaves push -w 3
 cursaves push -w 497e8ab0   # by hash (from the Hash column)
 ```
 
-`push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports into Cursor's database. `sync` does both automatically — pulling conversations where your local copy is behind, and pushing ones where your local copy is ahead. After importing, restart Cursor (quit and reopen) to see the conversations.
+`push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports only conversations that are missing locally or behind the snapshot. Already-synced and local-ahead chats are left alone, with no Cursor writes. `cursaves pull --restore-all` re-imports every valid snapshot of that exact origin. `sync` does both automatically — pulling conversations where your local copy is behind, and pushing ones where your local copy is ahead. After importing, restart Cursor (quit and reopen) to see the conversations.
 
 For Remote SSH workspaces, always pass `-w` so the host is part of the project identity. `pull -p` / a bare path will not auto-import SSH snapshots.
 
@@ -194,12 +194,13 @@ S3 avoids git history overhead and works well for large snapshot sets. Authentic
 cursaves sync
 
 # Or manually:
-cursaves push              # checkpoint + push
-cursaves pull              # pull + import into Cursor's database
+cursaves push                # checkpoint + push
+cursaves pull                # pull + import missing/behind conversations
+cursaves pull --restore-all  # re-import every valid snapshot of this origin
 # Then restart Cursor to see the imported conversations
 ```
 
-The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts. If a conversation has diverged (local and snapshot histories are no longer append-only), `sync` aborts before importing or pushing changes. `--force` does not override that.
+The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts. If a conversation has diverged (local and snapshot histories are no longer append-only), `sync` aborts before importing or pushing changes. `--force` does not override that. `pull` is directional: it imports the safe behind/missing chats and skips diverged or unreadable ones instead of aborting the whole command.
 
 ## Commands
 
@@ -210,7 +211,7 @@ All commands default to the current working directory as the project path. Use `
 | **`sync`**     | **Pull behind + push ahead — one command to stay in sync** | Yes                   |
 | **`push`**     | **Checkpoint + push to remote**                            | No                    |
 | **`push -s`**  | **Interactively select which conversations to push**       | No                    |
-| **`pull`**     | **Pull from remote + import snapshots**                    | Yes                   |
+| **`pull`**     | **Pull from remote + import missing/behind snapshots**     | Yes (only if needed)  |
 | `init`         | Initialize sync (git remote, S3 bucket, etc.)              | No                    |
 | `workspaces`   | List all Cursor workspaces (local, SSH, custom) with hash  | No                    |
 | `list`         | Show conversations for a project                           | No                    |
@@ -293,7 +294,7 @@ Note: "Developer: Reload Window" is not sufficient -- it reloads the renderer bu
 ## Safety
 
 - **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) snapshot Cursor's live SQLite via the Online Backup API, then read the copy. Safe to run while Cursor is open.
-- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while the Cursor desktop app is detected as running (macOS and Linux). Use `--force` to override (not recommended).
+- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while the Cursor desktop app is detected as running (macOS and Linux). `pull` skips that check — and takes no safety backup — when there is nothing to import. Use `--force` to write while Cursor is running (not recommended). `--force` does not override a diverged or unreadable conversation.
 - Concurrent cursaves processes on the same machine serialize Cursor DB writes and local `~/.cursaves` snapshot-tree/backend work with advisory flocks under `~/.config/cursaves/` (`sqlite-write.lock`, `repo.lock`). This does not lock Git or S3 across machines. If another local process holds a lock, the command prints that it is waiting (up to 2 minutes by default) and exits with an error on timeout. Lock files are never deleted; the kernel drops a held flock when the process exits.
 - Snapshots are self-contained JSON -- even if import goes wrong, you always have the raw data and the backup.
 
@@ -366,9 +367,10 @@ cursaves pull -s
 #  → Skips a group if no matching host is open (fail closed)
 
 # Or by workspace number, hash, or path
-cursaves workspaces          # List workspaces; note the #, Hash, or path
-cursaves pull -w 3           # By number — uses that host's identity
-cursaves pull -w 497e8ab0    # By hash
+cursaves workspaces               # List workspaces; note the #, Hash, or path
+cursaves pull -w 3                # By number — uses that host's identity
+cursaves pull -w 497e8ab0         # By hash
+cursaves pull -w 3 --restore-all  # re-import every valid snapshot of that origin
 ```
 
 `pull -p /some/path` (no `-w`) never auto-resolves a snapshot bucket that contains Remote SSH chats. Use `-w` or `pull -s`.
