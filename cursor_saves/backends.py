@@ -18,6 +18,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
+from . import dblock
+
 
 _CONFIG_PATH = Path.home() / ".config" / "cursaves" / "config.json"
 
@@ -66,9 +68,14 @@ class GitBackend(SyncBackend):
     def pull(self, snapshots_dir: Path) -> bool:
         if not self.has_remote():
             return True
-        return self._reset_to_origin()
+        with dblock.repo_lock():
+            return self._reset_to_origin()
 
     def push(self, snapshots_dir: Path) -> bool:
+        with dblock.repo_lock():
+            return self._push_unlocked(snapshots_dir)
+
+    def _push_unlocked(self, snapshots_dir: Path) -> bool:
         subprocess.run(
             ["git", "add", "snapshots/"],
             cwd=str(self.sync_dir), capture_output=True,
@@ -264,6 +271,10 @@ class S3Backend(SyncBackend):
 
     def pull(self, snapshots_dir: Path) -> bool:
         """Download all remote snapshot files that are newer or missing locally."""
+        with dblock.repo_lock():
+            return self._pull_unlocked(snapshots_dir)
+
+    def _pull_unlocked(self, snapshots_dir: Path) -> bool:
         client = self._get_client()
         try:
             paginator = client.get_paginator("list_objects_v2")
@@ -301,6 +312,10 @@ class S3Backend(SyncBackend):
 
     def push(self, snapshots_dir: Path) -> bool:
         """Upload local snapshot files that are newer or missing remotely."""
+        with dblock.repo_lock():
+            return self._push_unlocked(snapshots_dir)
+
+    def _push_unlocked(self, snapshots_dir: Path) -> bool:
         client = self._get_client()
         try:
             # Build index of remote objects

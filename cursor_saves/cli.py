@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, db, export, paths
+from . import __version__, db, dblock, export, paths
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
     copy_between_workspaces,
@@ -45,6 +45,11 @@ def _get_snapshot_id(path: Path) -> str:
 
 def _delete_snapshot(path: Path):
     """Delete a snapshot file (or its shards) and metadata sidecar."""
+    with dblock.repo_lock():
+        _delete_snapshot_unlocked(path)
+
+
+def _delete_snapshot_unlocked(path: Path):
     sid = _get_snapshot_id(path)
     if path.exists():
         path.unlink()
@@ -739,6 +744,8 @@ def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBacken
 
     Returns the number of conversations pushed.
     """
+    db.finish_cursor_writes()
+
     if backend is None:
         backend = get_backend()
 
@@ -958,6 +965,11 @@ def cmd_sync(args):
     else:
         print("  Everything up to date")
 
+    # Cursor writes from the import phase are committed and connections
+    # closed. Drop the process-wide sqlite write lock before snapshot/Git
+    # so we never acquire repo.lock while holding sqlite (deadlock).
+    db.finish_cursor_writes()
+
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
     pushed = _push_ahead(sync_dir, auto=True, backend=backend)
@@ -1013,31 +1025,32 @@ def cmd_push(args):
             print("No conversations selected.")
             return
 
-    # Step 1: Checkpoint
-    if composer_ids:
-        print(f"\nCheckpointing {len(composer_ids)} conversation(s)...")
-    else:
-        print(f"Checkpointing all conversations for {project_path}...")
-    saved = export.checkpoint_project(
-        project_path, composer_ids=composer_ids,
-        workspace_dir=workspace_dir, source_host=source_host,
-    )
-
-    if not saved:
-        print("No conversations found to checkpoint.")
-        return
-
-    print(f"  {len(saved)} conversation(s) checkpointed")
-
-    # Step 2: Push to remote
-    if backend.has_remote():
-        print("  Pushing...", end="", flush=True)
-        if backend.push(snapshots_dir):
-            print(" done")
+    # Step 1+2: Checkpoint and push under one repo lock so two local
+    # processes cannot interleave snapshot-tree writes and backend push.
+    with dblock.repo_lock():
+        if composer_ids:
+            print(f"\nCheckpointing {len(composer_ids)} conversation(s)...")
         else:
-            print(" failed", file=sys.stderr)
-    else:
-        print("  No remote configured, skipping push")
+            print(f"Checkpointing all conversations for {project_path}...")
+        saved = export.checkpoint_project(
+            project_path, composer_ids=composer_ids,
+            workspace_dir=workspace_dir, source_host=source_host,
+        )
+
+        if not saved:
+            print("No conversations found to checkpoint.")
+            return
+
+        print(f"  {len(saved)} conversation(s) checkpointed")
+
+        if backend.has_remote():
+            print("  Pushing...", end="", flush=True)
+            if backend.push(snapshots_dir):
+                print(" done")
+            else:
+                print(" failed", file=sys.stderr)
+        else:
+            print("  No remote configured, skipping push")
 
     print(f"\nDone. {len(saved)} conversation(s) saved.")
 
@@ -1380,7 +1393,8 @@ def cmd_delete(args):
                 return
 
         for p in projects:
-            shutil.rmtree(p["path"])
+            with dblock.repo_lock():
+                shutil.rmtree(p["path"])
             print(f"  Deleted: {p['name']}/ ({p['count']} snapshots)")
 
         print(f"\nDeleted {total_count} snapshot(s) across {len(projects)} project(s).")
@@ -1424,7 +1438,8 @@ def cmd_delete(args):
         total_deleted = 0
         deleted_names = []
         for p in selected_projects:
-            shutil.rmtree(p["path"])
+            with dblock.repo_lock():
+                shutil.rmtree(p["path"])
             print(f"  Deleted: {p['name']}/ ({p['count']} snapshots)")
             total_deleted += p["count"]
             deleted_names.append(p["name"])
@@ -2010,7 +2025,14 @@ def main():
         )
         sys.exit(1)
 
-    args.func(args)
+    try:
+        args.func(args)
+    except dblock.FileLockTimeout as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except dblock.LockOrderError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

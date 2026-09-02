@@ -6,6 +6,79 @@ import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
+
+from . import dblock
+
+_write_owners: set["CursorDB"] = set()
+
+
+def write_connections_open() -> bool:
+    """True if any CursorDB still has an open write connection."""
+    return bool(_write_owners)
+
+
+def close_all_write_connections() -> None:
+    """Close every tracked Cursor write connection."""
+    for owner in list(_write_owners):
+        owner.close_write()
+
+
+def finish_cursor_writes() -> None:
+    """Close write connections, then drop the process-wide sqlite write lock.
+
+    Call this after a Cursor-write phase and before any ``repo_lock()``
+    acquisition. Does not release while a write connection is still open.
+    """
+    close_all_write_connections()
+    if write_connections_open():
+        raise RuntimeError(
+            "cannot release sqlite write lock while write connections are open"
+        )
+    dblock.release_write_lock()
+
+
+def reset_write_tracking_for_tests() -> None:
+    """Tests only."""
+    close_all_write_connections()
+
+
+def sqlite_file_uri(path: Path, *, mode: str = "ro") -> str:
+    """Build a sqlite URI for *path* (absolute, query-safe)."""
+    resolved = path.resolve()
+    quoted = quote(resolved.as_posix(), safe="/")
+    return f"file:{quoted}?mode={mode}"
+
+
+def snapshot_live_db(src_path: Path, dst_path: Path) -> None:
+    """Create a standalone consistent snapshot via the Online Backup API.
+
+    The destination is a self-contained database: WAL/SHM sidecars do not
+    need to be copied. SQLite coordinates with other connections (including
+    Cursor) while pages are copied.
+    """
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    src = None
+    dst = None
+    try:
+        src = sqlite3.connect(sqlite_file_uri(src_path), uri=True, timeout=30.0)
+        dst = sqlite3.connect(str(dst_path), timeout=30.0)
+        src.backup(dst)
+    except Exception:
+        if dst is not None:
+            try:
+                dst.close()
+            except sqlite3.Error:
+                pass
+            dst = None
+        if dst_path.exists():
+            dst_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if dst is not None:
+            dst.close()
+        if src is not None:
+            src.close()
 
 
 class CursorDB:
@@ -29,24 +102,16 @@ class CursorDB:
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
-        # Copy the main db file and any WAL/SHM files
+        # Consistent snapshot of the live DB. The cursaves flock only
+        # serializes other cursaves writers; sqlite.backup() coordinates
+        # with Cursor's own connections, including WAL.
         tmp_dir = tempfile.mkdtemp(prefix="cursaves-")
         tmp_db = Path(tmp_dir) / "state.vscdb"
-        shutil.copy2(self.db_path, tmp_db)
-
-        # Also copy WAL and SHM if they exist (needed for recent writes)
-        for suffix in ("-wal", "-shm"):
-            wal_file = self.db_path.parent / (self.db_path.name + suffix)
-            if wal_file.exists():
-                shutil.copy2(wal_file, Path(tmp_dir) / (tmp_db.name + suffix))
+        with dblock.temporary_lock():
+            snapshot_live_db(self.db_path, tmp_db)
 
         self._tmp_path = tmp_db
         self._conn = sqlite3.connect(str(tmp_db))
-        # Checkpoint WAL into main db for consistent reads
-        try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.OperationalError:
-            pass  # Not in WAL mode, that's fine
         return self._conn
 
     def close(self):
@@ -54,9 +119,7 @@ class CursorDB:
         if self._conn:
             self._conn.close()
             self._conn = None
-        if hasattr(self, "_write_conn") and self._write_conn:
-            self._write_conn.close()
-            self._write_conn = None
+        self.close_write()
         if self._tmp_path:
             shutil.rmtree(self._tmp_path.parent, ignore_errors=True)
             self._tmp_path = None
@@ -159,10 +222,20 @@ class CursorDB:
 
     # ── Write operations (on original file) ─────────────────────────
 
+    def close_write(self) -> None:
+        """Close the write connection on the original database, if any."""
+        conn = getattr(self, "_write_conn", None)
+        if conn is not None:
+            conn.close()
+            self._write_conn = None
+        _write_owners.discard(self)
+
     def _get_write_conn(self) -> sqlite3.Connection:
         """Get or create a connection for write operations on the ORIGINAL database."""
+        dblock.acquire_write_lock()
         if not hasattr(self, "_write_conn") or self._write_conn is None:
             self._write_conn = sqlite3.connect(str(self.db_path))
+            _write_owners.add(self)
         return self._write_conn
 
     def write_item(self, key: str, value: str, table: str = "ItemTable"):
@@ -261,14 +334,11 @@ def backup_db(db_path: Path, keep: int = 2) -> Path:
     """
     from datetime import datetime
 
+    dblock.acquire_write_lock()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.parent / f"{db_path.stem}.backup_{timestamp}{db_path.suffix}"
-    shutil.copy2(db_path, backup_path)
-
-    for suffix in ("-wal", "-shm"):
-        wal = db_path.parent / (db_path.name + suffix)
-        if wal.exists():
-            shutil.copy2(wal, db_path.parent / (backup_path.name + suffix))
+    snapshot_live_db(db_path, backup_path)
 
     # Clean up old backups, keeping only the newest `keep`
     pattern = f"{db_path.stem}.backup_*{db_path.suffix}"

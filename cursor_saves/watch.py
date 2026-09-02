@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import export, paths
+from . import dblock, export, paths
 
 
 def _get_db_fingerprint(
@@ -246,22 +246,22 @@ def watch_loop(
         # Change detected -- checkpoint
         print(f"[{_now()}] change detected, checkpointing...")
         try:
-            saved = checkpoint_watched_project(
-                project_path,
-                workspace_dir=workspace_dir,
-                source_host=source_host,
-            )
-            if saved:
-                checkpoint_count += 1
-                print(f"[{_now()}] checkpointed {len(saved)} conversation(s) (total: {checkpoint_count})")
+            with dblock.repo_lock():
+                saved = checkpoint_watched_project(
+                    project_path,
+                    workspace_dir=workspace_dir,
+                    source_host=source_host,
+                )
+                if saved:
+                    checkpoint_count += 1
+                    print(f"[{_now()}] checkpointed {len(saved)} conversation(s) (total: {checkpoint_count})")
 
-                # Git sync
-                if git_sync and repo_root:
-                    success, msg = _git_sync(repo_root, project_path)
-                    print(f"[{_now()}] git: {msg}")
-            else:
-                if verbose:
-                    print(f"[{_now()}] no conversations to checkpoint")
+                    if git_sync and repo_root:
+                        success, msg = _git_sync(repo_root, project_path)
+                        print(f"[{_now()}] git: {msg}")
+                else:
+                    if verbose:
+                        print(f"[{_now()}] no conversations to checkpoint")
 
         except Exception as e:
             print(f"[{_now()}] error during checkpoint: {e}", file=sys.stderr)
