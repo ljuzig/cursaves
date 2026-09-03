@@ -837,11 +837,13 @@ def test_all_thinking_blocks_are_semantic():
     assert _relation(local, remote) == syncstate.SyncRelation.DIVERGED
 
 
-def test_missing_referenced_bubble_is_unknown():
+def test_missing_referenced_bubble_is_a_tombstone():
     snap = _conversation([_msg(1, "A")], composer_id=CID_A)
     del snap["bubbleEntries"]["bubble-1"]
-    with pytest.raises(syncstate.ClassifyError, match="referenced bubble is missing"):
-        syncstate.snapshot_unit_hashes(snap)
+    hashes = syncstate.snapshot_unit_hashes(snap)
+    assert len(hashes) == 1
+    present = _conversation([_msg(1, "A")], composer_id=CID_A)
+    assert hashes != syncstate.snapshot_unit_hashes(present)
 
 
 def test_same_cid_other_project_is_never_pushed(sync_env):
