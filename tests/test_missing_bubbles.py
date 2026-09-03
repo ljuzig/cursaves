@@ -251,7 +251,7 @@ def test_corrupt_local_bubble_json_is_unknown(sync_env):
     assert rel == syncstate.SyncRelation.UNKNOWN
 
 
-def test_v1_sidecar_digest_never_trusted_under_v2(sync_env):
+def test_v1_sidecar_digest_never_trusted_under_current(sync_env):
     snap = _conversation([_msg(1, "A")], composer_id=CID_A)
     _commit_env(sync_env, [snap], [snap], digest=True, gzip_cids={CID_A})
     meta_path = sync_env["project_dir"] / f"{CID_A}.meta.json"
@@ -277,7 +277,7 @@ def test_v1_sidecar_digest_never_trusted_under_v2(sync_env):
     payload = json.loads(cache_path.read_text())
     assert payload["version"] == syncstate._CACHE_VERSION
     for rec in payload["snapshots"].values():
-        assert rec["semanticDigestVersion"] == 2
+        assert rec["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
         assert rec["semanticDigest"] != "sha256:not-a-real-v2-digest"
 
     syncstate.reset_op_counts()
@@ -290,7 +290,7 @@ def test_v1_sidecar_digest_never_trusted_under_v2(sync_env):
     assert syncstate.op_counts().deep_snapshot_reads == 0
 
 
-def test_nine_hundred_warm_v2_preserves_fast_path(sync_env):
+def test_nine_hundred_warm_current_digest_preserves_fast_path(sync_env):
     n = 900
     snaps = [
         _conversation(
@@ -308,9 +308,10 @@ def test_nine_hundred_warm_v2_preserves_fast_path(sync_env):
 
     cache_path = sync_env["tmp"] / "cache" / "sync-semantics.json"
     payload = json.loads(cache_path.read_text())
-    assert payload["version"] == 4
+    assert payload["version"] == syncstate._CACHE_VERSION
     assert all(
-        rec["semanticDigestVersion"] == 2 for rec in payload["snapshots"].values()
+        rec["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
+        for rec in payload["snapshots"].values()
     )
 
     syncstate.reset_op_counts()
