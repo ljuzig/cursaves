@@ -11,6 +11,11 @@ A regenerable on-disk cache stores snapshot and local fingerprints so
 legacy gzip and local semantic parses are not repeated every command.
 The cache is never authoritative when missing or stale. Snapshot files
 are never rewritten.
+
+A header with no bubble body is a first-class tombstone, not an error.
+``SEMANTIC_DIGEST_VERSION`` 2 hashes an explicit missing/present bubble
+state. Sidecar v1 digests are never trusted; the snapshot is deep-read
+and the regenerable cache stores v2.
 """
 
 from __future__ import annotations
@@ -58,8 +63,8 @@ _TOP_LEVEL_TRANSPORT_KEYS = frozenset({
 
 _EXPLICIT_BLOB_KEYS = frozenset({"contentHash", "blobId", "contentHashes"})
 
-_CACHE_VERSION = 3
-SEMANTIC_DIGEST_VERSION = 1
+_CACHE_VERSION = 4
+SEMANTIC_DIGEST_VERSION = 2
 _HASH_CHUNK = 1024 * 1024
 
 
@@ -214,13 +219,30 @@ def _required_blob_ids(payload: Any, available: set[str]) -> list[str]:
     return required
 
 
-def _unit_payload(header: dict, bubble: dict, blobs: dict[str, Any]) -> dict[str, Any]:
-    """Hash header, bubble, and blobs. Snapshot envelope keys never enter here."""
+def _unit_payload(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> dict[str, Any]:
+    """Hash header, explicit bubble state, and blobs.
+
+    A missing bubble is a tombstone keyed by ``bubbleId``, not a generic
+    empty object — so missing↔missing compares and missing↔present diverges.
+    Header fields and header-referenced blobs stay in the unit either way.
+    """
+    bid = header.get("bubbleId")
+    if not bid:
+        raise ClassifyError("header is missing bubbleId")
+    if bubble is None:
+        bubble_part: dict[str, Any] = {"state": "missing", "bubbleId": bid}
+        ref_payload: Any = header
+    else:
+        bubble_part = {
+            "state": "present",
+            "value": _normalize_unit_object(bubble, top=True),
+        }
+        ref_payload = (header, bubble)
     payload: dict[str, Any] = {
         "header": _normalize_unit_object(header, top=True),
-        "bubble": _normalize_unit_object(bubble, top=True),
+        "bubble": bubble_part,
     }
-    refs = _referenced_blob_ids((header, bubble), set(blobs))
+    refs = _referenced_blob_ids(ref_payload, set(blobs))
     if refs:
         payload["blobs"] = {
             ref: _sha256_bytes(_blob_bytes(blobs[ref])) for ref in sorted(refs)
@@ -229,9 +251,29 @@ def _unit_payload(header: dict, bubble: dict, blobs: dict[str, Any]) -> dict[str
 
 
 def unit_hash(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> str:
-    if bubble is None:
-        raise ClassifyError("referenced bubble is missing")
     return _sha256_text(_canonical_json(_unit_payload(header, bubble, blobs)))
+
+
+def _strict_select_json(cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV") -> Optional[Any]:
+    """Parse a cell. None means the key is absent or contains JSON null."""
+    try:
+        conn = cdb._reader_conn()
+        row = conn.execute(
+            f"SELECT value FROM {table} WHERE key = ?",
+            (key,),
+        ).fetchone()
+    except Exception as exc:
+        raise ClassifyError(f"failed to read {key}: {exc}") from exc
+    if row is None:
+        return None
+    raw = row[0]
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+        raise ClassifyError(f"corrupt JSON at {key}: {exc}") from exc
+    return parsed
 
 
 def conversation_digest(unit_hashes: list[str]) -> str:
@@ -255,14 +297,41 @@ def _headers(composer_data: Optional[dict]) -> list[dict]:
     return [h for h in headers if isinstance(h, dict)]
 
 
+def _optional_mapping(value: Any, name: str) -> Optional[dict]:
+    """Absent/null is OK. A present non-object is unreadable, not a tombstone."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ClassifyError(f"{name} is not an object")
+    return value
+
+
+def _coerce_bubble(bubble: Any, bubble_id: str) -> Optional[dict]:
+    """Present dict, None tombstone, or ClassifyError for corrupt bodies."""
+    if bubble is None:
+        return None
+    if not isinstance(bubble, dict):
+        raise ClassifyError(f"referenced bubble is not an object: {bubble_id}")
+    return bubble
+
+
 def _bubble_from_snapshot(snapshot: dict, bubble_id: str) -> Optional[dict]:
-    entries = snapshot.get("bubbleEntries") or {}
-    if bubble_id in entries:
-        return entries[bubble_id]
-    composer = snapshot.get("composerData") or {}
-    cmap = composer.get("conversationMap") or {}
-    if isinstance(cmap, dict) and bubble_id in cmap:
-        return cmap[bubble_id]
+    """Return the bubble body, or None when the header is a tombstone.
+
+    A missing key or JSON null on the primary map means “no body here”:
+    try ``conversationMap`` next. A present non-object is unreadable
+    and must not be hashed as a tombstone. Corrupt containers are
+    UNKNOWN, not empty maps.
+    """
+    entries = _optional_mapping(snapshot.get("bubbleEntries"), "bubbleEntries")
+    if entries is not None and bubble_id in entries:
+        bubble = _coerce_bubble(entries[bubble_id], bubble_id)
+        if bubble is not None:
+            return bubble
+    composer = snapshot["composerData"]
+    cmap = _optional_mapping(composer.get("conversationMap"), "conversationMap")
+    if cmap is not None and bubble_id in cmap:
+        return _coerce_bubble(cmap[bubble_id], bubble_id)
     return None
 
 
@@ -286,9 +355,8 @@ def snapshot_unit_hashes(snapshot: dict) -> list[str]:
         if not bid:
             raise ClassifyError("header is missing bubbleId")
         bubble = _bubble_from_snapshot(snapshot, bid)
-        if bubble is None:
-            raise ClassifyError(f"referenced bubble is missing: {bid}")
-        refs = _required_blob_ids((header, bubble), set(blobs))
+        ref_payload: Any = header if bubble is None else (header, bubble)
+        refs = _required_blob_ids(ref_payload, set(blobs))
         for ref in refs:
             if ref not in blobs:
                 raise ClassifyError(f"referenced blob missing: {ref}")
@@ -821,13 +889,17 @@ class SyncReadSession:
             bid = header.get("bubbleId")
             if not bid:
                 raise ClassifyError("local header is missing bubbleId")
-            bubble = self._cdb.get_json(f"bubbleId:{composer_id}:{bid}")
+            bubble = _strict_select_json(self._cdb, f"bubbleId:{composer_id}:{bid}")
             if bubble is None:
-                cmap = data.get("conversationMap") or {}
-                bubble = cmap.get(bid) if isinstance(cmap, dict) else None
-            if bubble is None:
-                raise ClassifyError(f"referenced bubble is missing locally: {bid}")
-            blob_payload = (header, bubble)
+                cmap = _optional_mapping(
+                    data.get("conversationMap"),
+                    "local conversationMap",
+                )
+                if cmap is not None and bid in cmap:
+                    bubble = _coerce_bubble(cmap[bid], bid)
+            elif not isinstance(bubble, dict):
+                raise ClassifyError(f"local bubble {bid} is not an object")
+            blob_payload: Any = header if bubble is None else (header, bubble)
             blobs: dict[str, Any] = {}
             for ref in _required_blob_ids(blob_payload, available):
                 val = self._cdb.get_disk_kv(f"composer.content.{ref}")
