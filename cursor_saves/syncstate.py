@@ -13,9 +13,10 @@ The cache is never authoritative when missing or stale. Snapshot files
 are never rewritten.
 
 A header with no bubble body is a first-class tombstone, not an error.
-``SEMANTIC_DIGEST_VERSION`` 2 hashes an explicit missing/present bubble
-state. Sidecar v1 digests are never trusted; the snapshot is deep-read
-and the regenerable cache stores v2.
+``SEMANTIC_DIGEST_VERSION`` 3 hashes an explicit missing/present bubble
+state and omits derived ``header.grouping``. Older sidecar digests are
+never trusted; the snapshot is deep-read and the regenerable cache
+stores the current version.
 """
 
 from __future__ import annotations
@@ -63,8 +64,8 @@ _TOP_LEVEL_TRANSPORT_KEYS = frozenset({
 
 _EXPLICIT_BLOB_KEYS = frozenset({"contentHash", "blobId", "contentHashes"})
 
-_CACHE_VERSION = 4
-SEMANTIC_DIGEST_VERSION = 2
+_CACHE_VERSION = 5
+SEMANTIC_DIGEST_VERSION = 3
 _HASH_CHUNK = 1024 * 1024
 
 
@@ -219,6 +220,17 @@ def _required_blob_ids(payload: Any, available: set[str]) -> list[str]:
     return required
 
 
+def _semantic_header(header: dict) -> dict:
+    """Header fields that participate in the digest.
+
+    ``grouping`` is derived UI/tool-render metadata. Only this key is
+    dropped — other header fields stay semantic.
+    """
+    cleaned = dict(header)
+    cleaned.pop("grouping", None)
+    return cleaned
+
+
 def _unit_payload(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> dict[str, Any]:
     """Hash header, explicit bubble state, and blobs.
 
@@ -226,6 +238,7 @@ def _unit_payload(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -
     empty object — so missing↔missing compares and missing↔present diverges.
     Header fields and header-referenced blobs stay in the unit either way.
     """
+    header = _semantic_header(header)
     bid = header.get("bubbleId")
     if not bid:
         raise ClassifyError("header is missing bubbleId")
@@ -355,7 +368,8 @@ def snapshot_unit_hashes(snapshot: dict) -> list[str]:
         if not bid:
             raise ClassifyError("header is missing bubbleId")
         bubble = _bubble_from_snapshot(snapshot, bid)
-        ref_payload: Any = header if bubble is None else (header, bubble)
+        sem_header = _semantic_header(header)
+        ref_payload: Any = sem_header if bubble is None else (sem_header, bubble)
         refs = _required_blob_ids(ref_payload, set(blobs))
         for ref in refs:
             if ref not in blobs:
@@ -899,7 +913,8 @@ class SyncReadSession:
                     bubble = _coerce_bubble(cmap[bid], bid)
             elif not isinstance(bubble, dict):
                 raise ClassifyError(f"local bubble {bid} is not an object")
-            blob_payload: Any = header if bubble is None else (header, bubble)
+            sem_header = _semantic_header(header)
+            blob_payload: Any = sem_header if bubble is None else (sem_header, bubble)
             blobs: dict[str, Any] = {}
             for ref in _required_blob_ids(blob_payload, available):
                 val = self._cdb.get_disk_kv(f"composer.content.{ref}")
