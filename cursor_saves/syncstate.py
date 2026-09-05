@@ -24,13 +24,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Collection, Iterator, Optional
 
-from . import db, export, importer, paths
+from . import db, dblock, export, importer, paths
 
 
 class SyncRelation(str, Enum):
@@ -83,9 +84,17 @@ class ClassifyError(Exception):
     """Conversation cannot be classified safely."""
 
 
+class SyncPreflightStale(Exception):
+    """Cursor or snapshot state changed after the read-only preflight."""
+
+
 @dataclass
 class OpCounts:
     sqlite_backups: int = 0
+    read_copy_global: int = 0
+    read_copy_workspace: int = 0
+    live_epochs: int = 0
+    backup_epochs: int = 0
     snapshot_directory_scans: int = 0
     deep_snapshot_reads: int = 0
     legacy_snapshot_decompressions: int = 0
@@ -814,10 +823,16 @@ _COMPOSER_UNREADABLE = object()
 
 
 class SyncReadSession:
-    """One consistent read-only SQLite snapshot of the global Cursor DB."""
+    """One consistent read-only SQLite view of the global Cursor DB.
+
+    Owns a single ``ReadEpoch`` for the command's read-only phase, plus
+    the header map and per-CID presence/payload derived from that view.
+    Not a process-global cache keyed on ``db_path``.
+    """
 
     def __init__(self, global_db: Optional[Path] = None):
         self._global_path = global_db if global_db is not None else paths.get_global_db_path()
+        self._epoch: Optional[db.ReadEpoch] = None
         self._cdb: Optional[db.CursorDB] = None
         self._local_hashes: dict[str, list[str]] = {}
         self._local_digest: dict[str, str] = {}
@@ -825,20 +840,35 @@ class SyncReadSession:
         self._blob_ids: Optional[set[str]] = None
         self._inventory_complete = False
         self._inventory_attempted = False
+        self._inventory_scope: Optional[set[str]] = None
+        self._targeted_absent: set[str] = set()
         self._composer_cells: dict[str, Any] = {}
         self._presence: dict[str, LocalPresence] = {}
+        self._composer_headers: Optional[list[dict]] = None
+        self._headers_map: Optional[dict[str, list[dict]]] = None
         self.cache = SemanticsCache()
 
     def __enter__(self) -> "SyncReadSession":
         if self._global_path.exists():
-            self._cdb = db.CursorDB(self._global_path)
-            self._cdb._ensure_read_copy()
-            _counts.sqlite_backups += 1
+            self._epoch = db.ReadEpoch(self._global_path)
+            self._epoch.__enter__()
+            self._cdb = db.CursorDB(self._global_path, read_epoch=self._epoch)
         return self
 
-    def _ensure_inventory(self) -> None:
+    def prepare_inventory(self, composer_ids: Optional[Collection[str]]) -> None:
+        """Choose full scan (``None``) or a targeted CID set. Caller decides."""
+        self._inventory_scope = None if composer_ids is None else set(composer_ids)
+        self._ensure_inventory()
+
+    def _ensure_inventory(self, composer_ids: Optional[Collection[str]] = None) -> None:
         """Scan composer/bubble bytes only when a digest fast-path needs it."""
-        if self._inventory_attempted or self._cdb is None:
+        if self._inventory_complete or self._cdb is None:
+            return
+        ids = set(composer_ids) if composer_ids is not None else self._inventory_scope
+        if ids is not None:
+            self._load_inventory_targeted(ids)
+            return
+        if self._inventory_attempted:
             return
         self._inventory_attempted = True
         self._load_inventory()
@@ -848,10 +878,42 @@ class SyncReadSession:
         if self._cdb is not None:
             self._cdb.close()
             self._cdb = None
+        if self._epoch is not None:
+            self._epoch.close()
+            self._epoch = None
 
     @property
     def cdb(self) -> Optional[db.CursorDB]:
         return self._cdb
+
+    @property
+    def epoch(self) -> Optional[db.ReadEpoch]:
+        return self._epoch
+
+    def composer_headers(self) -> list[dict]:
+        if self._composer_headers is None:
+            self._composer_headers = []
+            if self._cdb is not None:
+                headers = self._cdb.get_json(
+                    "composer.composerHeaders", table="ItemTable"
+                )
+                if headers and isinstance(headers, dict):
+                    self._composer_headers = headers.get("allComposers", []) or []
+        return self._composer_headers
+
+    def headers_map(self) -> dict[str, list[dict]]:
+        if self._headers_map is None:
+            self._headers_map = paths._headers_map_from_entries(self.composer_headers())
+        return self._headers_map
+
+    def _ingest_composer_row(
+        self, cid: str, composer_raw: bytes, bubbles: list[tuple[str, bytes]]
+    ) -> str:
+        hasher = hashlib.sha256()
+        _hash_field(hasher, f"composerData:{cid}".encode("utf-8"), composer_raw)
+        for bid, raw in bubbles:
+            _hash_field(hasher, f"bubbleId:{cid}:{bid}".encode("utf-8"), raw)
+        return "sha256:" + hasher.hexdigest()
 
     def _load_inventory(self) -> None:
         """Stream raw composer/bubble bytes into per-CID row fingerprints.
@@ -898,11 +960,59 @@ class SyncReadSession:
             self._row_fp = {}
             self._inventory_complete = False
 
+    def _load_inventory_targeted(self, composer_ids: Collection[str]) -> None:
+        """Fingerprint only *composer_ids* with the same hash as a full scan."""
+        if self._cdb is None:
+            return
+        try:
+            conn = self._cdb._ensure_read_copy()
+        except Exception:
+            return
+        for cid in composer_ids:
+            if cid in self._row_fp or cid in self._targeted_absent:
+                continue
+            try:
+                row = conn.execute(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?",
+                    (f"composerData:{cid}",),
+                ).fetchone()
+            except Exception:
+                continue
+            if row is None:
+                self._targeted_absent.add(cid)
+                continue
+            bubbles: list[tuple[str, bytes]] = []
+            try:
+                for key, val in conn.execute(
+                    "SELECT key, value FROM cursorDiskKV "
+                    "WHERE key LIKE ? ORDER BY key",
+                    (f"bubbleId:{cid}:%",),
+                ):
+                    parts = key.split(":", 2)
+                    if len(parts) < 3:
+                        continue
+                    bubbles.append((parts[2], _as_bytes(val)))
+            except Exception:
+                continue
+            self._row_fp[cid] = self._ingest_composer_row(
+                cid, _as_bytes(row[0]), bubbles
+            )
+
     def raw_fingerprint(self, composer_id: str) -> Optional[str]:
-        self._ensure_inventory()
-        if not self._inventory_complete:
+        if composer_id in self._row_fp:
+            return self._row_fp[composer_id]
+        if composer_id in self._targeted_absent:
             return None
-        return self._row_fp.get(composer_id)
+        if self._inventory_complete:
+            return None
+        self._ensure_inventory(
+            [composer_id] if self._inventory_scope is not None else None
+        )
+        if composer_id in self._row_fp:
+            return self._row_fp[composer_id]
+        if composer_id in self._targeted_absent or self._inventory_complete:
+            return None
+        return None
 
     def composer_cell(self, composer_id: str) -> tuple[bool, Any]:
         """Return ``(row_present, parsed)``. JSON null is ``(True, None)``."""
@@ -913,7 +1023,9 @@ class SyncReadSession:
             if val is _COMPOSER_ABSENT:
                 return False, None
             return True, val
-        if self._inventory_complete and composer_id not in self._row_fp:
+        if (
+            self._inventory_complete or composer_id in self._targeted_absent
+        ) and composer_id not in self._row_fp:
             self._composer_cells[composer_id] = _COMPOSER_ABSENT
             return False, None
         if self._cdb is None:
@@ -999,10 +1111,13 @@ class SyncReadSession:
         if composer_id in self._local_digest:
             return self._local_digest[composer_id]
         self._ensure_inventory()
-        if self._inventory_complete:
-            row_fp = self._row_fp.get(composer_id)
-            if row_fp is None:
-                return None
+        row_fp = self.raw_fingerprint(composer_id)
+        known_absent = (
+            self._inventory_complete or composer_id in self._targeted_absent
+        )
+        if row_fp is None and known_absent:
+            return None
+        if row_fp:
             cached = self.cache.get_local(composer_id)
             if cached and cached["rowFingerprint"] == row_fp:
                 blob_fp = self._hash_blob_refs(list(cached.get("blobRefs") or []))
@@ -1054,17 +1169,16 @@ class SyncReadSession:
         self._local_hashes[composer_id] = hashes
         digest = conversation_digest(hashes)
         self._local_digest[composer_id] = digest
-        if self._inventory_complete:
-            row_fp = self._row_fp.get(composer_id)
-            if row_fp:
-                blob_refs = sorted(discovered)
-                self.cache.put_local(
-                    composer_id,
-                    row_fp,
-                    blob_refs,
-                    self._hash_blob_refs(blob_refs),
-                    digest,
-                )
+        row_fp = self._row_fp.get(composer_id)
+        if row_fp:
+            blob_refs = sorted(discovered)
+            self.cache.put_local(
+                composer_id,
+                row_fp,
+                blob_refs,
+                self._hash_blob_refs(blob_refs),
+                digest,
+            )
         return hashes
 
     def local_digest(self, composer_id: str) -> Optional[str]:
@@ -1097,11 +1211,16 @@ class PlannedItem:
     relation: SyncRelation
     name: str = ""
     snapshot_path: Optional[Path] = None
+    staged_path: Optional[Path] = None
     meta: dict = field(default_factory=dict)
     workspace_dir: Optional[Path] = None
     project_path: str = ""
     source_host: Optional[str] = None
     project_identifier: str = ""
+    classified_identity: tuple = ()
+    classified_content_digest: str = ""
+    dest_expected_present: Optional[bool] = None
+    local_guard: Optional["LocalGuard"] = None
 
 
 @dataclass
@@ -1267,12 +1386,15 @@ def build_sync_plan(
     if target_workspace is not None:
         workspaces = [target_workspace]
     elif workspaces is None:
-        workspaces = paths.list_workspaces_with_conversations()
+        workspaces = paths.list_workspaces_with_conversations(session=session)
 
     target_ids: Optional[set[str]] = None
     snapshot_project_id: Optional[str] = None
     if target_workspace is not None:
-        target_ids = _target_workspace_composer_ids(target_workspace)
+        target_ids = _target_workspace_composer_ids(
+            target_workspace, session=session
+        )
+        session.prepare_inventory(target_ids)
         # Identity of the already-resolved snapshot bucket, not the
         # canonical workspace ID. A scoped index of snapshots/nixos/
         # must still match SSH chats whose workspace ID is
@@ -1282,6 +1404,8 @@ def build_sync_plan(
             index.scoped_project_identifier
             or paths.get_workspace_project_identifier(target_workspace)
         )
+    else:
+        session.prepare_inventory(None)
 
     for ws in workspaces:
         ws_dir = ws["workspace_dir"]
@@ -1290,7 +1414,7 @@ def build_sync_plan(
             continue
         project_id = paths.get_workspace_project_identifier(ws)
         lookup_id = snapshot_project_id or project_id
-        composer_ids = paths.get_workspace_composer_ids(db_path)
+        composer_ids = paths.get_workspace_composer_ids(db_path, session=session)
         for cid in composer_ids:
             key = (lookup_id, cid)
             if key in seen:
@@ -1322,19 +1446,33 @@ def build_sync_plan(
                         )
                     except ClassifyError:
                         relation = SyncRelation.UNKNOWN
-                plan.items.append(
-                    PlannedItem(
-                        composer_id=cid,
-                        relation=relation,
-                        name=_planned_name(session, rec, cid, relation),
-                        snapshot_path=rec.path if rec else None,
-                        meta=rec.meta if rec else {},
-                        workspace_dir=ws_dir,
-                        project_path=ws.get("path") or "",
-                        source_host=ws.get("host"),
-                        project_identifier=lookup_id,
-                    )
+                item = PlannedItem(
+                    composer_id=cid,
+                    relation=relation,
+                    name=_planned_name(session, rec, cid, relation),
+                    snapshot_path=rec.path if rec else None,
+                    meta=rec.meta if rec else {},
+                    workspace_dir=ws_dir,
+                    project_path=ws.get("path") or "",
+                    source_host=ws.get("host"),
+                    project_identifier=lookup_id,
                 )
+                if relation == SyncRelation.BEHIND:
+                    present = session.raw_fingerprint(cid) is not None
+                    if rec is None or not _pin_behind_item(
+                        item,
+                        session,
+                        rec,
+                        expect_present=present,
+                        expect_in_target=True,
+                    ):
+                        item.relation = SyncRelation.UNKNOWN
+                elif relation == SyncRelation.LOCAL_AHEAD:
+                    if rec is None or not _pin_ahead_dest(item, rec):
+                        item.relation = SyncRelation.UNKNOWN
+                elif relation == SyncRelation.NEVER_PUSHED:
+                    _pin_ahead_dest(item, rec)
+                plan.items.append(item)
             finally:
                 session.release_composer_cell(cid)
 
@@ -1374,19 +1512,28 @@ def build_sync_plan(
                 remote_ws_dir = None
                 remote_path = rec.meta.get("sourceProjectPath") or ""
                 remote_host = rec.meta.get("sourceHost")
-            plan.items.append(
-                PlannedItem(
-                    composer_id=rec.composer_id,
-                    relation=relation,
-                    name=rec.meta.get("name") or "Untitled",
-                    snapshot_path=rec.path,
-                    meta=rec.meta,
-                    workspace_dir=remote_ws_dir,
-                    project_path=remote_path,
-                    source_host=remote_host,
-                    project_identifier=rec.project_identifier,
-                )
+            item = PlannedItem(
+                composer_id=rec.composer_id,
+                relation=relation,
+                name=rec.meta.get("name") or "Untitled",
+                snapshot_path=rec.path,
+                meta=rec.meta,
+                workspace_dir=remote_ws_dir,
+                project_path=remote_path,
+                source_host=remote_host,
+                project_identifier=rec.project_identifier,
             )
+            if relation == SyncRelation.BEHIND:
+                present = session.raw_fingerprint(rec.composer_id) is not None
+                if not _pin_behind_item(
+                    item,
+                    session,
+                    rec,
+                    expect_present=present,
+                    expect_in_target=False,
+                ):
+                    item.relation = SyncRelation.UNKNOWN
+            plan.items.append(item)
         finally:
             session.release_composer_cell(rec.composer_id)
     index.cache.flush()
@@ -1533,14 +1680,14 @@ def _record_matches_target(rec: SnapshotRecord, workspace: dict) -> bool:
     return True
 
 
-def _target_workspace_composer_ids(workspace: dict) -> set[str]:
+def _target_workspace_composer_ids(workspace: dict, session=None) -> set[str]:
     ws_dir = workspace.get("workspace_dir")
     if not ws_dir:
         return set()
     ws_db = Path(ws_dir) / "state.vscdb"
     if not ws_db.exists():
         return set()
-    return set(paths.get_workspace_composer_ids(ws_db))
+    return set(paths.get_workspace_composer_ids(ws_db, session=session))
 
 
 def _global_has_composer(session: SyncReadSession, composer_id: str) -> bool:
@@ -1566,6 +1713,80 @@ def _candidate_content_digest(rec: SnapshotRecord) -> str:
     if isinstance(sidecar, str) and sidecar:
         return sidecar
     return snapshot_content_digest(rec.path, rec.meta)
+
+
+def _pin_ahead_dest(item: PlannedItem, rec: Optional[SnapshotRecord]) -> bool:
+    """Pin the destination identity classified at preflight. Absence is False."""
+    if rec is None:
+        item.dest_expected_present = False
+        item.classified_identity = ()
+        return True
+    item.dest_expected_present = True
+    item.classified_identity = rec.identity
+    return True
+
+
+def _item_destination_main(item: PlannedItem) -> Path:
+    if item.snapshot_path is not None:
+        return item.snapshot_path
+    return (
+        paths.get_snapshots_dir()
+        / item.project_identifier
+        / f"{item.composer_id}.json.gz"
+    )
+
+
+def _dest_matches_preflight(item: PlannedItem) -> bool:
+    if item.dest_expected_present is None:
+        return False
+    present, identity = destination_snapshot_identity(
+        _item_destination_main(item), item.meta
+    )
+    if present != item.dest_expected_present:
+        return False
+    if present and identity != item.classified_identity:
+        return False
+    return True
+
+
+def verify_ahead_destinations(plan: SyncPlan) -> None:
+    """Abort if any AHEAD/NEVER_PUSHED destination changed since preflight."""
+    for item in plan.items:
+        if item.relation not in (
+            SyncRelation.LOCAL_AHEAD,
+            SyncRelation.NEVER_PUSHED,
+        ):
+            continue
+        if not _dest_matches_preflight(item):
+            raise SyncPreflightStale(
+                f"destination changed for {item.composer_id}"
+            )
+
+
+def _pin_behind_item(
+    item: PlannedItem,
+    session: SyncReadSession,
+    rec: SnapshotRecord,
+    *,
+    expect_present: bool,
+    expect_in_target: bool,
+) -> bool:
+    """Attach LocalGuard + classified snapshot identity. False = fail closed."""
+    item.classified_identity = rec.identity
+    try:
+        item.classified_content_digest = _candidate_content_digest(rec)
+    except OSError:
+        return False
+    guard = capture_local_guard(
+        session,
+        item.composer_id,
+        expect_present=expect_present,
+        expect_in_target=expect_in_target,
+    )
+    if guard is None:
+        return False
+    item.local_guard = guard
+    return True
 
 
 def capture_local_guard(
@@ -1704,7 +1925,7 @@ def _live_target_has_composer(
 
 
 def local_guard_still_matches(
-    item: "PullItem",
+    item: Any,
     global_cdb: "db.CursorDB",
     workspace_cdb: "db.CursorDB",
 ) -> bool:
@@ -1754,7 +1975,8 @@ def build_pull_plan(
     plan = PullPlan(restore_all=restore_all)
     session.cache = index.cache
     selected = {p.resolve() for p in selected_paths} if selected_paths else None
-    target_ids = _target_workspace_composer_ids(target_workspace)
+    target_ids = _target_workspace_composer_ids(target_workspace, session=session)
+    session.prepare_inventory(target_ids)
     snapshot_cids: set[str] = set()
     ws_dir = target_workspace.get("workspace_dir")
     project_path = target_workspace.get("path") or ""
@@ -1848,71 +2070,249 @@ def build_pull_plan(
     return plan
 
 
+def _stage_snapshot_item(item: Any, staging_dir: Path) -> bool:
+    """Freeze one classified snapshot into *staging_dir*. False if stale/unreadable."""
+    if item.snapshot_path is None:
+        return False
+    try:
+        current_identity = snapshot_source_identity(item.snapshot_path, item.meta)
+    except OSError:
+        return False
+    if item.classified_identity and current_identity != item.classified_identity:
+        return False
+
+    dest_dir = staging_dir / item.project_identifier / item.composer_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    components = importer.snapshot_component_files(item.snapshot_path, item.meta)
+    if not components:
+        return False
+    try:
+        for src in components:
+            shutil.copy2(src, dest_dir / src.name)
+        sidecar = importer.snapshot_sidecar_path(item.snapshot_path)
+        if sidecar.exists():
+            shutil.copy2(sidecar, dest_dir / sidecar.name)
+    except OSError:
+        return False
+
+    staged_main = dest_dir / item.snapshot_path.name
+    try:
+        staged_digest = snapshot_content_digest(staged_main, item.meta)
+    except OSError:
+        return False
+    if item.classified_content_digest and staged_digest != item.classified_content_digest:
+        return False
+    try:
+        if snapshot_source_identity(item.snapshot_path, item.meta) != current_identity:
+            return False
+    except OSError:
+        return False
+
+    item.staged_path = staged_main
+    _counts.staged_snapshots += 1
+    return True
+
+
 def stage_import_candidates(plan: PullPlan, staging_dir: Path) -> list[PullItem]:
     """Copy only import candidates (main + shards + sidecar) under *staging_dir*.
 
     Verifies the source identity is unchanged and the staged bytes match
     the classified ``snapshotContentDigest``. A mismatch becomes UNKNOWN.
     """
-    import shutil
-
     staged: list[PullItem] = []
     for item in list(plan.import_candidates):
-        if item.snapshot_path is None:
+        if not _stage_snapshot_item(item, staging_dir):
             item.action = PullAction.SKIP
             item.relation = PullRelation.UNKNOWN
             continue
-        try:
-            current_identity = snapshot_source_identity(item.snapshot_path, item.meta)
-        except OSError:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-        if item.classified_identity and current_identity != item.classified_identity:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-
-        dest_dir = staging_dir / item.project_identifier / item.composer_id
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        components = importer.snapshot_component_files(item.snapshot_path, item.meta)
-        if not components:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-        try:
-            for src in components:
-                shutil.copy2(src, dest_dir / src.name)
-            sidecar = importer.snapshot_sidecar_path(item.snapshot_path)
-            if sidecar.exists():
-                shutil.copy2(sidecar, dest_dir / sidecar.name)
-        except OSError:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-
-        staged_main = dest_dir / item.snapshot_path.name
-        try:
-            staged_digest = snapshot_content_digest(staged_main, item.meta)
-        except OSError:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-        if item.classified_content_digest and staged_digest != item.classified_content_digest:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-        try:
-            if snapshot_source_identity(item.snapshot_path, item.meta) != current_identity:
-                item.action = PullAction.SKIP
-                item.relation = PullRelation.UNKNOWN
-                continue
-        except OSError:
-            item.action = PullAction.SKIP
-            item.relation = PullRelation.UNKNOWN
-            continue
-
-        item.staged_path = staged_main
-        _counts.staged_snapshots += 1
         staged.append(item)
     return staged
+
+
+def stage_behind_snapshots(plan: SyncPlan, staging_dir: Path) -> bool:
+    """Pin every BEHIND snapshot. False if any classified file changed."""
+    if plan.unsafe:
+        return False
+    for item in plan.behind:
+        if not _stage_snapshot_item(item, staging_dir):
+            return False
+    return True
+
+
+def verify_behind_guards(items: list[Any]) -> bool:
+    """True if every item's LocalGuard still matches live Cursor state."""
+    if not items:
+        return True
+    global_path = paths.get_global_db_path()
+    if not global_path.exists():
+        return all(
+            item.local_guard is not None and not item.local_guard.expect_present
+            for item in items
+        )
+    with db.CursorDB(global_path) as gdb:
+        opened: dict[Path, db.CursorDB] = {}
+        try:
+            for item in items:
+                if item.local_guard is None:
+                    return False
+                ws_dir = item.workspace_dir
+                if ws_dir is None:
+                    live_fp = _live_row_fingerprint(gdb, item.composer_id)
+                    present = live_fp is not None
+                    if present != item.local_guard.expect_present:
+                        return False
+                    if item.local_guard.expect_in_target:
+                        return False
+                    if not item.local_guard.expect_present:
+                        continue
+                    if live_fp != item.local_guard.row_fingerprint:
+                        return False
+                    if (
+                        _live_blob_fingerprint(gdb, item.local_guard.blob_refs)
+                        != item.local_guard.blob_fingerprint
+                    ):
+                        return False
+                    continue
+                ws_dir = Path(ws_dir)
+                if ws_dir not in opened:
+                    ws_db = ws_dir / "state.vscdb"
+                    if not ws_db.exists():
+                        return False
+                    opened[ws_dir] = db.CursorDB(ws_db)
+                if not local_guard_still_matches(item, gdb, opened[ws_dir]):
+                    return False
+            return True
+        except Exception:
+            return False
+        finally:
+            for cdb in opened.values():
+                cdb.close()
+
+
+def destination_snapshot_identity(
+    dest_main: Path, meta: Optional[dict] = None
+) -> tuple[bool, tuple]:
+    """Return ``(present, identity)`` for a destination snapshot path."""
+    components = importer.snapshot_component_files(dest_main, meta)
+    if not components:
+        return False, ()
+    try:
+        return True, snapshot_source_identity(dest_main, meta)
+    except OSError:
+        return False, ()
+
+
+@dataclass
+class AheadExpectation:
+    """Destination identity observed when the LOCAL_AHEAD plan was built."""
+
+    composer_id: str
+    project_identifier: str
+    dest_main: Path
+    dest_meta: dict
+    expected_present: bool
+    expected_identity: tuple
+    staged_project: Path
+
+
+@dataclass
+class StagedAhead:
+    """LOCAL_AHEAD snapshots materialized from the preflight read view."""
+
+    lease: Any
+    count: int
+    expectations: list[AheadExpectation] = field(default_factory=list)
+    promoted: bool = False
+
+    def discard(self) -> None:
+        if self.promoted or self.lease is None:
+            return
+        self.lease.release()
+        self.lease = None
+
+
+def stage_ahead_exports(
+    plan: SyncPlan,
+    session: SyncReadSession,
+) -> Optional[StagedAhead]:
+    """Export LOCAL_AHEAD chats from the open preflight view into a lease.
+
+    Must be called before the read epoch is closed. Does nothing when the
+    plan is unsafe or has no ahead items — no lease is created.
+    """
+    if plan.unsafe:
+        return None
+    verify_ahead_destinations(plan)
+    if not plan.ahead:
+        return None
+    lease = db.acquire_lease("ahead")
+    snapshots_root = lease.path / "snapshots"
+    expectations: list[AheadExpectation] = []
+    saved = 0
+    try:
+        target_dir = None
+        if plan.target_workspace is not None:
+            target_dir = plan.target_workspace.get("workspace_dir")
+        for item in plan.ahead:
+            if target_dir is not None and item.workspace_dir != target_dir:
+                continue
+            snapshot = session.export_conversation(
+                item.project_path,
+                item.composer_id,
+                source_host=item.source_host,
+            )
+            if not snapshot:
+                continue
+            dest_main = _item_destination_main(item)
+            export.save_snapshot(snapshot, snapshots_root)
+            expectations.append(
+                AheadExpectation(
+                    composer_id=item.composer_id,
+                    project_identifier=item.project_identifier,
+                    dest_main=dest_main,
+                    dest_meta=dict(item.meta),
+                    expected_present=bool(item.dest_expected_present),
+                    expected_identity=item.classified_identity,
+                    staged_project=snapshots_root / item.project_identifier,
+                )
+            )
+            saved += 1
+    except BaseException:
+        lease.release()
+        raise
+    if saved == 0:
+        lease.release()
+        return None
+    return StagedAhead(lease=lease, count=saved, expectations=expectations)
+
+
+def promote_staged_ahead(staged: StagedAhead) -> int:
+    """CAS-install staged ahead snapshots into the real snapshots tree.
+
+    Rechecks every expected destination identity under ``repo_lock``
+    before the first mutation. A stale destination aborts the whole
+    promote. Replacement uses the same component-clearing semantics as
+    ``save_snapshot``.
+    """
+    with dblock.repo_lock():
+        for exp in staged.expectations:
+            present, identity = destination_snapshot_identity(
+                exp.dest_main, exp.dest_meta
+            )
+            if present != exp.expected_present:
+                raise SyncPreflightStale(
+                    f"destination changed for {exp.composer_id}"
+                )
+            if present and identity != exp.expected_identity:
+                raise SyncPreflightStale(
+                    f"destination changed for {exp.composer_id}"
+                )
+        for exp in staged.expectations:
+            dest_proj = exp.dest_main.parent
+            export.install_staged_snapshot(
+                dest_proj, exp.composer_id, exp.staged_project
+            )
+    staged.promoted = True
+    staged.lease.release()
+    staged.lease = None
+    return staged.count

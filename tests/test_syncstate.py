@@ -268,8 +268,9 @@ def sync_env(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "get_snapshots_dir", lambda: snaps)
     monkeypatch.setattr(paths, "get_sync_dir", lambda: sync_dir)
     monkeypatch.setattr(paths, "is_sync_repo_initialized", lambda: True)
-    monkeypatch.setattr(paths, "_build_global_headers_map", lambda: {})
-    monkeypatch.setattr(paths, "list_workspaces_with_conversations", list_ws)
+    monkeypatch.setattr(paths, "_build_global_headers_map", lambda *a, **k: {})
+    monkeypatch.setattr(paths, "list_workspaces_with_conversations", lambda *a, **k: list_ws())
+    monkeypatch.setattr(paths, "list_all_workspaces", lambda: list_ws())
     monkeypatch.setattr(paths, "_get_git_remote_url", lambda _path: None)
     monkeypatch.setattr(paths, "get_machine_id", lambda: "test-machine")
     monkeypatch.setattr(paths, "get_cache_dir", lambda: tmp_path / "cache")
@@ -662,10 +663,10 @@ def test_linear_sync_imports_then_releases_then_pushes(sync_env, monkeypatch):
     backend.push = tracking_push
 
     cli.cmd_sync(type("Args", (), {"force": False})())
-    assert order[0] == "import"
+    assert order[0] == "save"
+    assert order.index("save") < order.index("import")
     assert order.index("import") < order.index("finish")
-    assert order.index("finish") < order.index("save")
-    assert order.index("save") < order.index("push")
+    assert order.index("finish") < order.index("push")
     assert backend.pulls == 1
     assert backend.pushes == 1
 
