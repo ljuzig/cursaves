@@ -239,39 +239,41 @@ def format_timestamp(ts_ms: int) -> str:
 def list_conversations(
     project_path: str,
     workspace_dir: Optional[Path] = None,
+    session=None,
 ) -> list[dict]:
     """List all conversations for a project with display-friendly info.
 
     Returns list of dicts with: id, name, date, mode, messageCount.
+    Pass an open SyncReadSession to reuse its SQLite copy and payload cache.
     """
     conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
     if not conversations:
         return []
 
-    results = []
-    global_db = paths.get_global_db_path()
+    from . import syncstate
 
-    # Single DB connection for all lookups
-    with db.CursorDB(global_db) as cdb:
+    def _collect(sess: "syncstate.SyncReadSession") -> list[dict]:
+        results = []
         for c in conversations:
             composer_id = c.get("composerId", "unknown")
-
-            msg_count = 0
-            conv_data = cdb.get_json(f"composerData:{composer_id}")
-            if conv_data:
-                headers = conv_data.get("fullConversationHeadersOnly", [])
-                msg_count = len(headers)
-
+            if sess.local_presence(composer_id) != syncstate.LocalPresence.ACTIVE:
+                continue
+            conv_data = sess.composer_data(composer_id) or {}
+            headers = conv_data.get("fullConversationHeadersOnly") or []
             results.append({
                 "id": composer_id,
                 "name": c.get("name", "Untitled"),
                 "date": format_timestamp(c.get("createdAt", 0)),
                 "lastUpdated": format_timestamp(c.get("lastUpdatedAt", c.get("createdAt", 0))),
                 "mode": c.get("unifiedMode", c.get("forceMode", "unknown")),
-                "messageCount": msg_count,
+                "messageCount": len(headers) if isinstance(headers, list) else 0,
             })
+        return results
 
-    return results
+    if session is not None:
+        return _collect(session)
+    with syncstate.SyncReadSession() as owned:
+        return _collect(owned)
 
 
 MAX_COMPRESSED_SIZE_MB = 95  # Stay under GitHub's 100MB limit
@@ -410,6 +412,7 @@ def export_conversation(
     composer_id: str,
     _cdb: Optional[db.CursorDB] = None,
     source_host: Optional[str] = None,
+    composer_data: Optional[dict] = None,
 ) -> Optional[dict]:
     """Export a single conversation to a self-contained snapshot dict.
 
@@ -418,6 +421,7 @@ def export_conversation(
 
     Pass an open CursorDB via _cdb to avoid re-copying the global DB.
     Pass source_host for SSH workspaces (e.g. "core-3").
+    Pass composer_data to reuse a payload already read by SyncReadSession.
     """
     global_db = paths.get_global_db_path()
     own_cdb = _cdb is None
@@ -425,8 +429,13 @@ def export_conversation(
         _cdb = db.CursorDB(global_db)
 
     try:
-        conv_data = _cdb.get_json(f"composerData:{composer_id}")
-        if not conv_data:
+        conv_data = (
+            composer_data
+            if composer_data is not None
+            else _cdb.get_json(f"composerData:{composer_id}")
+        )
+        from . import syncstate
+        if syncstate.classify_local_payload(conv_data) != syncstate.LocalPresence.ACTIVE:
             return None
 
         # Bubble entries (individual message content)
@@ -657,20 +666,24 @@ def _checkpoint_project_unlocked(
             continue
         to_process.append((c, composer_id))
 
-    print(f"  Processing {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
-
+    from . import syncstate
     last_log_time = t0
     saved = []
-    global_db = paths.get_global_db_path()
-    with db.CursorDB(global_db) as cdb:
+    print(f"  Processing {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
+    with syncstate.SyncReadSession() as session:
         for i, (c, composer_id) in enumerate(to_process, 1):
-            # Export the conversation
-            snapshot = export_conversation(project_path, composer_id, _cdb=cdb, source_host=source_host)
-            if snapshot:
-                path = save_snapshot(snapshot, snapshots_dir)
-                saved.append(path)
-            
-            # Log progress: every 10 items, or every 10 seconds since last log
+            try:
+                if session.local_presence(composer_id) != syncstate.LocalPresence.ACTIVE:
+                    continue
+                snapshot = session.export_conversation(
+                    project_path, composer_id, source_host=source_host
+                )
+                if snapshot:
+                    path = save_snapshot(snapshot, snapshots_dir)
+                    saved.append(path)
+            finally:
+                session.release_composer_cell(composer_id)
+
             if i % 10 == 0 or (time.time() - last_log_time) >= 10:
                 print(f"  [{i}/{len(to_process)}] {composer_id}", file=sys.stderr, flush=True)
                 last_log_time = time.time()

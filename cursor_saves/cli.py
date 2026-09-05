@@ -161,12 +161,31 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
     session = getattr(_workspace_sync_summary, "_session", None)
     index = getattr(_workspace_sync_summary, "_index", None)
     for cid in composer_ids:
-        status = get_push_status_for_conversation(
-            cid, project_id, _cdb=_global_cdb, session=session, index=index,
-            source_host=ws.get("host"),
-            source_path=ws.get("path"),
-        )
-        counts[status] = counts.get(status, 0) + 1
+        try:
+            rec = None
+            if index is not None:
+                rec = index.get(
+                    cid,
+                    project_id,
+                    source_host=ws.get("host"),
+                    source_path=ws.get("path"),
+                )
+            if session is not None:
+                presence = syncstate.classify_local_conversation(session, cid)
+                if presence == syncstate.LocalPresence.INVALID:
+                    counts["unknown"] += 1
+                    continue
+                if syncstate.is_inactive_registration(presence, rec is not None):
+                    continue
+            status = get_push_status_for_conversation(
+                cid, project_id, _cdb=_global_cdb, session=session, index=index,
+                source_host=ws.get("host"),
+                source_path=ws.get("path"),
+            )
+            counts[status] = counts.get(status, 0) + 1
+        finally:
+            if session is not None:
+                session.release_composer_cell(cid)
 
     parts = []
     if counts["up_to_date"]:
@@ -192,7 +211,7 @@ def cmd_workspaces(args):
         print("No workspaces with conversations found.")
         return
 
-    print(f"{'#':<4} {'Type':<10} {'Path':<38} {'Host':<12} {'Chats':>5}  {'Hash':<9}  {'Sync Status'}")
+    print(f"{'#':<4} {'Type':<10} {'Path':<38} {'Host':<12} {'Refs':>5}  {'Hash':<9}  {'Sync Status'}")
     print("-" * 115)
 
     session = None
@@ -1401,24 +1420,38 @@ def cmd_status(args):
     project_id = paths.get_project_identifier(project_path, source_host=source_host)
     snapshots_dir = paths.get_snapshots_dir() / project_id
 
-    # Get local conversations
-    local_convos = export.list_conversations(project_path, workspace_dir=workspace_dir)
-    local_ids = {c["id"] for c in local_convos}
-
-    # Get snapshot conversations
     snapshot_ids = set()
     if snapshots_dir.exists():
         for f in list_snapshot_files(snapshots_dir):
             snapshot_ids.add(_get_snapshot_id(f))
 
-    only_local = local_ids - snapshot_ids
-    only_snapshot = snapshot_ids - local_ids
-    in_both = local_ids & snapshot_ids
+    registered: set[str] = set()
+    ws_dirs = [workspace_dir] if workspace_dir is not None else paths.find_workspace_dirs_for_project(project_path)
+    for ws_dir in ws_dirs:
+        if ws_dir is None:
+            continue
+        ws_db = Path(ws_dir) / "state.vscdb"
+        if ws_db.exists():
+            registered.update(paths.get_workspace_composer_ids(ws_db))
 
-    diverged = 0
-    unknown = 0
-    if in_both:
-        with syncstate.SyncReadSession() as session:
+    with syncstate.SyncReadSession() as session:
+        local_convos = export.list_conversations(
+            project_path, workspace_dir=workspace_dir, session=session
+        )
+        local_ids = {c["id"] for c in local_convos}
+        invalid = sum(
+            1
+            for cid in registered
+            if session.local_presence(cid) == syncstate.LocalPresence.INVALID
+        )
+
+        only_local = local_ids - snapshot_ids
+        only_snapshot = snapshot_ids - local_ids
+        in_both = local_ids & snapshot_ids
+
+        diverged = 0
+        unknown = 0
+        if in_both:
             index = syncstate.SnapshotIndex.build()
             for cid in in_both:
                 rel = syncstate.classify_conversation(
@@ -1428,6 +1461,7 @@ def cmd_status(args):
                     diverged += 1
                 elif rel == syncstate.SyncRelation.UNKNOWN:
                     unknown += 1
+        unknown += invalid
 
     print(f"Project: {project_path}")
     print(f"Identity: {project_id}")
