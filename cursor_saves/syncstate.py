@@ -45,11 +45,17 @@ class SyncRelation(str, Enum):
 
 
 class LocalPresence(str, Enum):
-    """Workspace registration vs an exportable local conversation."""
+    """Workspace registration vs an exportable local conversation.
+
+    ``NULL_TOMBSTONE`` is a present ``composerData`` row whose JSON value
+    is ``null``. That is a Cursor pane leftover, not a missing row
+    (``DANGLING``) and not a corrupt payload (``INVALID``).
+    """
 
     ACTIVE = "active"
     EMPTY = "empty"
     DANGLING = "dangling"
+    NULL_TOMBSTONE = "null_tombstone"
     INVALID = "invalid"
 
 
@@ -299,7 +305,12 @@ def unit_hash(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> st
 def _strict_select_row(
     cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV"
 ) -> tuple[bool, Any]:
-    """Return ``(row_present, parsed)``. JSON null is ``(True, None)``."""
+    """Return ``(row_present, parsed)``.
+
+    Both SQL NULL and JSON text ``null`` are ``(True, None)``. Cursor
+    persists pane tombstones as either form. An absent key is
+    ``(False, None)``.
+    """
     try:
         conn = cdb._reader_conn()
         row = conn.execute(
@@ -311,6 +322,8 @@ def _strict_select_row(
     if row is None:
         return False, None
     raw = row[0]
+    if raw is None:
+        return True, None
     try:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
@@ -327,9 +340,12 @@ def _strict_select_json(cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV
 
 
 def classify_local_payload(data: Any) -> LocalPresence:
-    """Classify a present ``composerData`` cell.
+    """Classify a decoded ``composerData`` value.
 
-    ``None`` is JSON null, not an absent row: that is INVALID. Callers
+    ``None`` is JSON null, not an absent row. This function stays
+    fail-closed: ``None`` and non-dicts are INVALID. Callers that know
+    the SQL row exists must map ``(True, None)`` to
+    ``NULL_TOMBSTONE`` themselves via ``classify_local_cell``. Callers
     that see a missing SQL row must return DANGLING themselves.
 
     Two message lists are recognized: modern
@@ -365,14 +381,29 @@ def semantic_message_count(data: Any) -> int:
     return 0
 
 
+def classify_local_cell(present: bool, data: Any) -> LocalPresence:
+    """Classify a ``composerData`` cell when row presence is known.
+
+    ``present and data is None`` is a JSON-null tombstone. That is
+    distinct from ``classify_local_payload(None)``, which stays INVALID
+    so callers that only have a decoded value remain fail-closed.
+    """
+    if not present:
+        return LocalPresence.DANGLING
+    if data is None:
+        return LocalPresence.NULL_TOMBSTONE
+    return classify_local_payload(data)
+
+
 def classify_local_conversation(
     session: "SyncReadSession", composer_id: str
 ) -> LocalPresence:
-    """Workspace CID → ACTIVE / EMPTY / DANGLING / INVALID.
+    """Workspace CID → ACTIVE / EMPTY / DANGLING / NULL_TOMBSTONE / INVALID.
 
     Headers or legacy ``conversation`` items present with missing bubble
     bodies stay ACTIVE. Only a true empty recognized list is EMPTY.
-    Read/JSON errors and JSON null are INVALID.
+    A present row whose JSON is ``null`` is NULL_TOMBSTONE. Read/JSON
+    errors and malformed payloads stay INVALID.
     """
     return session.local_presence(composer_id)
 
@@ -380,6 +411,27 @@ def classify_local_conversation(
 def is_inactive_registration(presence: LocalPresence, has_snapshot: bool) -> bool:
     """EMPTY/DANGLING with no snapshot: not a local conversation to export."""
     return presence in (LocalPresence.EMPTY, LocalPresence.DANGLING) and not has_snapshot
+
+
+def is_ignoreable_null_tombstone(
+    presence: LocalPresence,
+    *,
+    has_snapshot: bool,
+    has_typed_row: bool,
+) -> bool:
+    """Stale pane tombstone: no conversation, no snapshot, no typed row."""
+    return (
+        presence == LocalPresence.NULL_TOMBSTONE
+        and not has_snapshot
+        and not has_typed_row
+    )
+
+
+def is_broken_null_registration(
+    presence: LocalPresence, *, has_typed_row: bool
+) -> bool:
+    """Typed composerHeaders row exists, but composerData is JSON null."""
+    return presence == LocalPresence.NULL_TOMBSTONE and has_typed_row
 
 
 def conversation_digest(unit_hashes: list[str]) -> str:
@@ -1172,13 +1224,45 @@ class SyncReadSession:
             except ClassifyError:
                 presence = LocalPresence.INVALID
             else:
-                presence = (
-                    LocalPresence.DANGLING
-                    if not present
-                    else classify_local_payload(data)
-                )
+                presence = classify_local_cell(present, data)
         self._presence[composer_id] = presence
         return presence
+
+    def composer_row_is_json_null(self, composer_id: str) -> bool:
+        """True if the SQL row exists and the cell is SQL NULL or JSON ``null``.
+
+        Peeks the raw cell so discovery can drop pane tombstones without
+        parsing ACTIVE conversation payloads (warm digest path).
+        """
+        if composer_id in self._composer_cells:
+            val = self._composer_cells[composer_id]
+            if val is _COMPOSER_ABSENT or val is _COMPOSER_UNREADABLE:
+                return False
+            return val is None
+        if (
+            self._inventory_complete or composer_id in self._targeted_absent
+        ) and composer_id not in self._row_fp:
+            return False
+        if self._cdb is None:
+            return False
+        try:
+            conn = self._cdb._reader_conn()
+            row = conn.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (f"composerData:{composer_id}",),
+            ).fetchone()
+        except Exception:
+            return False
+        if row is None:
+            return False
+        raw = row[0]
+        if raw is None:
+            return True
+        try:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        except (UnicodeDecodeError, AttributeError):
+            return False
+        return isinstance(text, str) and text.strip() == "null"
 
     def composer_data(self, composer_id: str) -> Optional[dict]:
         try:
@@ -1310,7 +1394,7 @@ class SyncReadSession:
         if composer_id in self._local_hashes:
             return self._local_hashes[composer_id]
         present, data = self.composer_cell(composer_id)
-        if not present:
+        if not present or data is None:
             return None
         if classify_local_payload(data) == LocalPresence.INVALID:
             raise ClassifyError("local composerData is unreadable")
@@ -1647,11 +1731,20 @@ def build_sync_plan(
                 # digest hit must not re-parse composerData just to learn
                 # ACTIVE vs EMPTY. EMPTY/DANGLING with a snapshot stay in
                 # the plan so restore classification can still run.
+                # JSON-null tombstones with no snapshot and no typed row
+                # are Cursor pane leftovers, not conversations.
                 if rec is None:
                     presence = classify_local_conversation(session, cid)
+                    has_typed = session.typed_row(cid) is not None
+                    if is_ignoreable_null_tombstone(
+                        presence, has_snapshot=False, has_typed_row=has_typed
+                    ):
+                        continue
                     if is_inactive_registration(presence, False):
                         continue
-                    if presence == LocalPresence.INVALID:
+                    if presence == LocalPresence.INVALID or is_broken_null_registration(
+                        presence, has_typed_row=has_typed
+                    ):
                         relation = SyncRelation.UNKNOWN
                     else:
                         relation = SyncRelation.NEVER_PUSHED
@@ -1661,6 +1754,13 @@ def build_sync_plan(
                             session, index, cid, workspace=ws, project_identifier=lookup_id
                         )
                     except ClassifyError:
+                        relation = SyncRelation.UNKNOWN
+                    if (
+                        relation == SyncRelation.BEHIND
+                        and session.typed_row(cid) is not None
+                        and classify_local_conversation(session, cid)
+                        == LocalPresence.NULL_TOMBSTONE
+                    ):
                         relation = SyncRelation.UNKNOWN
                 item = PlannedItem(
                     composer_id=cid,
@@ -1677,7 +1777,7 @@ def build_sync_plan(
                     ),
                 )
                 if relation == SyncRelation.BEHIND:
-                    present = session.raw_fingerprint(cid) is not None
+                    present = _expect_conversation_present(session, cid)
                     if rec is None or not _pin_behind_item(
                         item,
                         session,
@@ -1789,7 +1889,7 @@ def build_sync_plan(
                 ),
             )
             if relation == SyncRelation.BEHIND:
-                present = session.raw_fingerprint(rec.composer_id) is not None
+                present = _expect_conversation_present(session, rec.composer_id)
                 if not _pin_behind_item(
                     item,
                     session,
@@ -1966,21 +2066,35 @@ def _target_workspace_composer_ids(workspace: dict, session=None) -> set[str]:
     return set(paths.get_workspace_composer_ids(ws_db, session=session))
 
 
+def _expect_conversation_present(
+    session: SyncReadSession, composer_id: str
+) -> bool:
+    """True if local composerData is a real conversation payload.
+
+    Absent rows and JSON-null pane tombstones are not conversations.
+    Unreadable or malformed payloads stay present (fail closed).
+    """
+    if session.raw_fingerprint(composer_id) is None:
+        return False
+    return session.local_presence(composer_id) != LocalPresence.NULL_TOMBSTONE
+
+
 def _global_has_composer(session: SyncReadSession, composer_id: str) -> bool:
     """True if the global Cursor DB already has this composer.
 
     Presence only — never used to classify semantics against another
-    workspace. Fail closed if the inventory is incomplete.
+    workspace. A JSON-null tombstone is not a conversation. Fail closed
+    if the cell is unreadable.
     """
     if session.cdb is None:
         return False
-    if session._inventory_complete:
-        return session.raw_fingerprint(composer_id) is not None
-    try:
-        present, _ = session.composer_cell(composer_id)
-    except ClassifyError:
-        return True
-    return present
+    if session._inventory_complete and session.raw_fingerprint(composer_id) is None:
+        return False
+    presence = session.local_presence(composer_id)
+    return presence not in (
+        LocalPresence.DANGLING,
+        LocalPresence.NULL_TOMBSTONE,
+    )
 
 
 def _candidate_content_digest(rec: SnapshotRecord) -> str:
@@ -2133,8 +2247,22 @@ def _live_select_json(cdb: "db.CursorDB", key: str, table: str) -> Optional[Any]
     return json.loads(raw)
 
 
+def _live_composer_is_null_or_absent(
+    cdb: "db.CursorDB", composer_id: str
+) -> bool:
+    """True if composerData is missing or JSON null. Malformed JSON is present."""
+    raw = _live_select_value(cdb, f"composerData:{composer_id}", "cursorDiskKV")
+    if raw is None:
+        return True
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        return json.loads(text) is None
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return False
+
+
 def _live_row_fingerprint(cdb: "db.CursorDB", composer_id: str) -> Optional[str]:
-    """Hash live composer + bubble rows. None only if the composer row is absent."""
+    """Hash live composer + bubble rows. None if absent or JSON-null tombstone."""
     conn = cdb._reader_conn()
     row = conn.execute(
         "SELECT value FROM cursorDiskKV WHERE key = ?",
@@ -2142,6 +2270,15 @@ def _live_row_fingerprint(cdb: "db.CursorDB", composer_id: str) -> Optional[str]
     ).fetchone()
     if row is None:
         return None
+    raw = row[0]
+    if raw is None:
+        return None
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        if json.loads(text) is None:
+            return None
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        pass
     hasher = hashlib.sha256()
     _hash_field(
         hasher,
@@ -2176,6 +2313,18 @@ def _live_target_has_composer(
     composer_id: str,
     workspace_dir: Optional[Path],
 ) -> bool:
+    # JSON-null / absent composerData: selected/focused/pane/allComposers
+    # are discovery hints, not membership. Only a typed row counts.
+    if _live_composer_is_null_or_absent(global_cdb, composer_id):
+        if workspace_dir is None:
+            return False
+        ws_hash = Path(workspace_dir).name
+        live_conn = global_cdb._reader_conn()
+        if typed_headers.typed_table_usable(live_conn):
+            typed_row = typed_headers.get_typed_row(live_conn, composer_id)
+            if typed_row is not None:
+                return typed_row.workspace_id == ws_hash
+        return False
     data = _live_select_json(workspace_cdb, "composer.composerData", "ItemTable")
     if isinstance(data, dict):
         for entry in data.get("allComposers") or []:
@@ -2296,7 +2445,18 @@ def build_pull_plan(
                     )
                 except ClassifyError:
                     sync_rel = SyncRelation.UNKNOWN
-                relation = _SYNC_TO_PULL.get(sync_rel, PullRelation.UNKNOWN)
+                if sync_rel == SyncRelation.BEHIND:
+                    presence = classify_local_conversation(
+                        session, rec.composer_id
+                    )
+                    if presence == LocalPresence.NULL_TOMBSTONE:
+                        if session.typed_row(rec.composer_id) is not None:
+                            sync_rel = SyncRelation.UNKNOWN
+                        else:
+                            sync_rel = None
+                            relation = PullRelation.MISSING_LOCAL
+                if sync_rel is not None:
+                    relation = _SYNC_TO_PULL.get(sync_rel, PullRelation.UNKNOWN)
 
             action = _pull_action(relation, restore_all)
             content_digest = ""

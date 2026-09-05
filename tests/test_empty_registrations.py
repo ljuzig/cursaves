@@ -72,6 +72,10 @@ def _plan(sync_env, target=None):
 
 def test_classify_local_payload_matrix():
     assert syncstate.classify_local_payload(None) == syncstate.LocalPresence.INVALID
+    assert syncstate.classify_local_cell(False, None) == syncstate.LocalPresence.DANGLING
+    assert syncstate.classify_local_cell(True, None) == (
+        syncstate.LocalPresence.NULL_TOMBSTONE
+    )
     assert (
         syncstate.classify_local_payload({"fullConversationHeadersOnly": []})
         == syncstate.LocalPresence.EMPTY
@@ -418,7 +422,8 @@ def test_workspaces_summary_omits_empty_not_pushed(sync_env, capsys):
     assert "ahead" not in out
 
 
-def test_json_null_composer_data_is_invalid(sync_env):
+def test_json_null_composer_data_payload_stays_invalid(sync_env):
+    """Decoded None stays INVALID; a present null row is a tombstone."""
     active = _active(CID_A)
     _commit_env(sync_env, [active], [active])
     conn = sqlite3.connect(str(sync_env["global_db"]))
@@ -435,14 +440,19 @@ def test_json_null_composer_data_is_invalid(sync_env):
 
     with syncstate.SyncReadSession() as session:
         assert (
+            syncstate.classify_local_payload(None) == syncstate.LocalPresence.INVALID
+        )
+        assert (
             syncstate.classify_local_conversation(session, CID_B)
-            == syncstate.LocalPresence.INVALID
+            == syncstate.LocalPresence.NULL_TOMBSTONE
         )
         index = syncstate.SnapshotIndex.build()
-        plan = syncstate.build_sync_plan(session, index, target_workspace=_target(sync_env))
-    by_id = {i.composer_id: i.relation for i in plan.items}
-    assert by_id[CID_B] == syncstate.SyncRelation.UNKNOWN
-    assert plan.unsafe
+        plan = syncstate.build_sync_plan(
+            session, index, target_workspace=_target(sync_env)
+        )
+    assert CID_B not in {i.composer_id for i in plan.items}
+    assert plan.unknown == []
+    assert not plan.unsafe
 
 
 def test_invalid_cid_in_two_workspaces_counted_once(sync_env, monkeypatch, capsys):
