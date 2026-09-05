@@ -436,6 +436,23 @@ def _legacy_workspace_composer_ids(
     return ids
 
 
+def _legacy_ids_without_null_tombstones(legacy_ids: set[str], session) -> set[str]:
+    """Drop JSON-null composerData leftovers. Legacy refs are only hints.
+
+    Typed rows are not passed here: a current registration with a null
+    payload must remain visible so planning can diagnose it. Without a
+    read session, leftovers stay (callers that classify later still
+    ignore stale tombstones).
+    """
+    if session is None or not legacy_ids:
+        return set(legacy_ids)
+    return {
+        cid
+        for cid in legacy_ids
+        if not session.composer_row_is_json_null(cid)
+    }
+
+
 def get_workspace_composer_ids(
     ws_db_path: Path,
     session=None,
@@ -454,6 +471,11 @@ def get_workspace_composer_ids(
     When the typed table is absent (older Cursor), behaviour matches
     the previous JSON + workspace union.
 
+    Legacy selected/focused/pane/allComposers IDs are discovery hints,
+    not proof a chat exists. A leftover CID whose ``composerData`` row
+    is JSON ``null`` is dropped unless it has a typed row (that case
+    must be diagnosed by the planner).
+
     Pass *session* or *headers_map* to reuse the command's global read
     epoch instead of opening another copy.
     """
@@ -463,7 +485,7 @@ def get_workspace_composer_ids(
     typed_exists, typed_catalog = typed_index_state(session)
     legacy_ids = _legacy_workspace_composer_ids(ws_db_path, ws_hash, headers_map)
     if not typed_exists:
-        return list(legacy_ids)
+        return list(_legacy_ids_without_null_tombstones(legacy_ids, session))
 
     typed_ids = {
         cid
@@ -472,7 +494,8 @@ def get_workspace_composer_ids(
         and not getattr(row, "is_subagent", 0)
     }
     typed_all = set(typed_catalog.keys())
-    return list(typed_ids | (legacy_ids - typed_all))
+    leftover = _legacy_ids_without_null_tombstones(legacy_ids - typed_all, session)
+    return list(typed_ids | leftover)
 
 
 def list_workspaces_with_conversations(session=None) -> list[dict]:
