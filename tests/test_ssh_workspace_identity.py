@@ -267,7 +267,7 @@ class _FakeCdb:
         if key.startswith("composerData:"):
             return {
                 "name": "test chat",
-                "fullConversationHeadersOnly": [],
+                "fullConversationHeadersOnly": [{"bubbleId": "b1", "type": 1}],
             }
         return None
 

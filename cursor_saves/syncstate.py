@@ -42,6 +42,15 @@ class SyncRelation(str, Enum):
     UNKNOWN = "unknown"
 
 
+class LocalPresence(str, Enum):
+    """Workspace registration vs an exportable local conversation."""
+
+    ACTIVE = "active"
+    EMPTY = "empty"
+    DANGLING = "dangling"
+    INVALID = "invalid"
+
+
 NOT_LOCAL = "not_local"
 
 # Top-level cursaves envelope — never part of conversation meaning.
@@ -65,6 +74,7 @@ _TOP_LEVEL_TRANSPORT_KEYS = frozenset({
 _EXPLICIT_BLOB_KEYS = frozenset({"contentHash", "blobId", "contentHashes"})
 
 _CACHE_VERSION = 5
+LOCAL_PAYLOAD_VERSION = 1
 SEMANTIC_DIGEST_VERSION = 3
 _HASH_CHUNK = 1024 * 1024
 
@@ -83,6 +93,7 @@ class OpCounts:
     cursor_write_connections: int = 0
     local_semantic_rehashes: int = 0
     local_inventory_json_parses: int = 0
+    local_composer_json_parses: int = 0
     pull_target_scans: int = 0
     pull_candidates: int = 0
     staged_snapshots: int = 0
@@ -267,8 +278,10 @@ def unit_hash(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> st
     return _sha256_text(_canonical_json(_unit_payload(header, bubble, blobs)))
 
 
-def _strict_select_json(cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV") -> Optional[Any]:
-    """Parse a cell. None means the key is absent or contains JSON null."""
+def _strict_select_row(
+    cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV"
+) -> tuple[bool, Any]:
+    """Return ``(row_present, parsed)``. JSON null is ``(True, None)``."""
     try:
         conn = cdb._reader_conn()
         row = conn.execute(
@@ -278,7 +291,7 @@ def _strict_select_json(cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV
     except Exception as exc:
         raise ClassifyError(f"failed to read {key}: {exc}") from exc
     if row is None:
-        return None
+        return False, None
     raw = row[0]
     try:
         if isinstance(raw, bytes):
@@ -286,7 +299,47 @@ def _strict_select_json(cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV
         parsed = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
         raise ClassifyError(f"corrupt JSON at {key}: {exc}") from exc
-    return parsed
+    return True, parsed
+
+
+def _strict_select_json(cdb: "db.CursorDB", key: str, table: str = "cursorDiskKV") -> Optional[Any]:
+    """Parse a cell. None means the key is absent or contains JSON null."""
+    present, parsed = _strict_select_row(cdb, key, table)
+    return parsed if present else None
+
+
+def classify_local_payload(data: Any) -> LocalPresence:
+    """Classify a present ``composerData`` cell.
+
+    ``None`` is JSON null, not an absent row: that is INVALID. Callers
+    that see a missing SQL row must return DANGLING themselves.
+    """
+    if data is None or not isinstance(data, dict):
+        return LocalPresence.INVALID
+    if "fullConversationHeadersOnly" not in data:
+        return LocalPresence.INVALID
+    headers = data["fullConversationHeadersOnly"]
+    if not isinstance(headers, list):
+        return LocalPresence.INVALID
+    if len(headers) == 0:
+        return LocalPresence.EMPTY
+    return LocalPresence.ACTIVE
+
+
+def classify_local_conversation(
+    session: "SyncReadSession", composer_id: str
+) -> LocalPresence:
+    """Workspace CID → ACTIVE / EMPTY / DANGLING / INVALID.
+
+    Headers present with missing bubble bodies stay ACTIVE. Only a true
+    empty header list is EMPTY. Read/JSON errors and JSON null are INVALID.
+    """
+    return session.local_presence(composer_id)
+
+
+def is_inactive_registration(presence: LocalPresence, has_snapshot: bool) -> bool:
+    """EMPTY/DANGLING with no snapshot: not a local conversation to export."""
+    return presence in (LocalPresence.EMPTY, LocalPresence.DANGLING) and not has_snapshot
 
 
 def conversation_digest(unit_hashes: list[str]) -> str:
@@ -496,6 +549,8 @@ class SemanticsCache:
             return None
         if rec.get("semanticDigestVersion") != SEMANTIC_DIGEST_VERSION:
             return None
+        if rec.get("localPayloadVersion") != LOCAL_PAYLOAD_VERSION:
+            return None
         if "blobRefs" not in rec or not rec.get("blobFingerprint"):
             return None
         return rec
@@ -514,6 +569,7 @@ class SemanticsCache:
             "blobFingerprint": blob_fp,
             "semanticDigest": digest,
             "semanticDigestVersion": SEMANTIC_DIGEST_VERSION,
+            "localPayloadVersion": LOCAL_PAYLOAD_VERSION,
         }
         self._dirty = True
 
@@ -753,6 +809,10 @@ class SnapshotIndex:
         self._load_remote_from_file(rec)
 
 
+_COMPOSER_ABSENT = object()
+_COMPOSER_UNREADABLE = object()
+
+
 class SyncReadSession:
     """One consistent read-only SQLite snapshot of the global Cursor DB."""
 
@@ -764,6 +824,9 @@ class SyncReadSession:
         self._row_fp: dict[str, str] = {}
         self._blob_ids: Optional[set[str]] = None
         self._inventory_complete = False
+        self._inventory_attempted = False
+        self._composer_cells: dict[str, Any] = {}
+        self._presence: dict[str, LocalPresence] = {}
         self.cache = SemanticsCache()
 
     def __enter__(self) -> "SyncReadSession":
@@ -771,8 +834,14 @@ class SyncReadSession:
             self._cdb = db.CursorDB(self._global_path)
             self._cdb._ensure_read_copy()
             _counts.sqlite_backups += 1
-            self._load_inventory()
         return self
+
+    def _ensure_inventory(self) -> None:
+        """Scan composer/bubble bytes only when a digest fast-path needs it."""
+        if self._inventory_attempted or self._cdb is None:
+            return
+        self._inventory_attempted = True
+        self._load_inventory()
 
     def __exit__(self, *args) -> None:
         self.cache.flush()
@@ -830,14 +899,70 @@ class SyncReadSession:
             self._inventory_complete = False
 
     def raw_fingerprint(self, composer_id: str) -> Optional[str]:
+        self._ensure_inventory()
         if not self._inventory_complete:
             return None
         return self._row_fp.get(composer_id)
 
-    def composer_data(self, composer_id: str) -> Optional[dict]:
+    def composer_cell(self, composer_id: str) -> tuple[bool, Any]:
+        """Return ``(row_present, parsed)``. JSON null is ``(True, None)``."""
+        if composer_id in self._composer_cells:
+            val = self._composer_cells[composer_id]
+            if val is _COMPOSER_UNREADABLE:
+                raise ClassifyError("local composerData is unreadable")
+            if val is _COMPOSER_ABSENT:
+                return False, None
+            return True, val
+        if self._inventory_complete and composer_id not in self._row_fp:
+            self._composer_cells[composer_id] = _COMPOSER_ABSENT
+            return False, None
         if self._cdb is None:
+            self._composer_cells[composer_id] = _COMPOSER_ABSENT
+            return False, None
+        try:
+            present, parsed = _strict_select_row(self._cdb, f"composerData:{composer_id}")
+        except ClassifyError:
+            self._composer_cells[composer_id] = _COMPOSER_UNREADABLE
+            raise
+        if not present:
+            self._composer_cells[composer_id] = _COMPOSER_ABSENT
+            return False, None
+        _counts.local_composer_json_parses += 1
+        self._composer_cells[composer_id] = parsed
+        return True, parsed
+
+    def local_presence(self, composer_id: str) -> LocalPresence:
+        cached = self._presence.get(composer_id)
+        if cached is not None:
+            return cached
+        if self._cdb is None:
+            presence = LocalPresence.DANGLING
+        else:
+            try:
+                present, data = self.composer_cell(composer_id)
+            except ClassifyError:
+                presence = LocalPresence.INVALID
+            else:
+                presence = (
+                    LocalPresence.DANGLING
+                    if not present
+                    else classify_local_payload(data)
+                )
+        self._presence[composer_id] = presence
+        return presence
+
+    def composer_data(self, composer_id: str) -> Optional[dict]:
+        try:
+            present, data = self.composer_cell(composer_id)
+        except ClassifyError:
             return None
-        return self._cdb.get_json(f"composerData:{composer_id}")
+        if not present or not isinstance(data, dict):
+            return None
+        return data
+
+    def release_composer_cell(self, composer_id: str) -> None:
+        """Drop a cached composerData payload. Presence stays."""
+        self._composer_cells.pop(composer_id, None)
 
     def _available_blob_ids(self) -> set[str]:
         if self._blob_ids is not None:
@@ -873,6 +998,7 @@ class SyncReadSession:
         """Reuse cached semantic digest when row + blob fingerprints match."""
         if composer_id in self._local_digest:
             return self._local_digest[composer_id]
+        self._ensure_inventory()
         if self._inventory_complete:
             row_fp = self._row_fp.get(composer_id)
             if row_fp is None:
@@ -891,9 +1017,11 @@ class SyncReadSession:
     def local_unit_hashes(self, composer_id: str) -> Optional[list[str]]:
         if composer_id in self._local_hashes:
             return self._local_hashes[composer_id]
-        data = self.composer_data(composer_id)
-        if not data or self._cdb is None:
+        present, data = self.composer_cell(composer_id)
+        if not present:
             return None
+        if classify_local_payload(data) == LocalPresence.INVALID:
+            raise ClassifyError("local composerData is unreadable")
         _counts.local_semantic_rehashes += 1
         headers = _headers(data)
         hashes: list[str] = []
@@ -951,12 +1079,16 @@ class SyncReadSession:
         if self._cdb is None:
             return None
         _counts.full_local_exports += 1
-        return export.export_conversation(
+        cached = self.composer_data(composer_id)
+        snapshot = export.export_conversation(
             project_path,
             composer_id,
             _cdb=self._cdb,
             source_host=source_host,
+            composer_data=cached,
         )
+        self.release_composer_cell(composer_id)
+        return snapshot
 
 
 @dataclass
@@ -1012,8 +1144,10 @@ def _planned_name(
         if meta_name:
             return meta_name
     if relation in (SyncRelation.DIVERGED, SyncRelation.UNKNOWN):
-        data = session.composer_data(composer_id) or {}
-        return data.get("name") or "Untitled"
+        data = session.composer_data(composer_id)
+        if isinstance(data, dict) and data.get("name"):
+            return data["name"]
+        return "Untitled"
     return "Untitled"
 
 
@@ -1057,7 +1191,10 @@ def classify_conversation(
         source_path=source_path,
     )
     if rec is None:
-        return SyncRelation.NEVER_PUSHED
+        presence = classify_local_conversation(session, composer_id)
+        if presence == LocalPresence.ACTIVE:
+            return SyncRelation.NEVER_PUSHED
+        return SyncRelation.UNKNOWN
     if rec.invalid_origin:
         return SyncRelation.UNKNOWN
 
@@ -1159,31 +1296,47 @@ def build_sync_plan(
             if key in seen:
                 continue
             seen.add(key)
-            rec = index.get(
-                cid,
-                lookup_id,
-                source_host=ws.get("host"),
-                source_path=ws.get("path"),
-            )
             try:
-                relation = classify_conversation(
-                    session, index, cid, workspace=ws, project_identifier=lookup_id
-                )
-            except ClassifyError:
-                relation = SyncRelation.UNKNOWN
-            plan.items.append(
-                PlannedItem(
-                    composer_id=cid,
-                    relation=relation,
-                    name=_planned_name(session, rec, cid, relation),
-                    snapshot_path=rec.path if rec else None,
-                    meta=rec.meta if rec else {},
-                    workspace_dir=ws_dir,
-                    project_path=ws.get("path") or "",
+                rec = index.get(
+                    cid,
+                    lookup_id,
                     source_host=ws.get("host"),
-                    project_identifier=lookup_id,
+                    source_path=ws.get("path"),
                 )
-            )
+                # Presence is only needed when there is no snapshot. A warm
+                # digest hit must not re-parse composerData just to learn
+                # ACTIVE vs EMPTY. EMPTY/DANGLING with a snapshot stay in
+                # the plan so restore classification can still run.
+                if rec is None:
+                    presence = classify_local_conversation(session, cid)
+                    if is_inactive_registration(presence, False):
+                        continue
+                    if presence == LocalPresence.INVALID:
+                        relation = SyncRelation.UNKNOWN
+                    else:
+                        relation = SyncRelation.NEVER_PUSHED
+                else:
+                    try:
+                        relation = classify_conversation(
+                            session, index, cid, workspace=ws, project_identifier=lookup_id
+                        )
+                    except ClassifyError:
+                        relation = SyncRelation.UNKNOWN
+                plan.items.append(
+                    PlannedItem(
+                        composer_id=cid,
+                        relation=relation,
+                        name=_planned_name(session, rec, cid, relation),
+                        snapshot_path=rec.path if rec else None,
+                        meta=rec.meta if rec else {},
+                        workspace_dir=ws_dir,
+                        project_path=ws.get("path") or "",
+                        source_host=ws.get("host"),
+                        project_identifier=lookup_id,
+                    )
+                )
+            finally:
+                session.release_composer_cell(cid)
 
     for rec in index.by_key.values():
         key = (rec.project_identifier, rec.composer_id)
@@ -1194,45 +1347,48 @@ def build_sync_plan(
                 continue
             if rec.project_identifier != snapshot_project_id:
                 continue
+        try:
             # CID present globally but not in this workspace belongs to
             # someone else. Do not treat it as this target's behind.
-            if rec.composer_id not in (
+            if target_workspace is not None and rec.composer_id not in (
                 target_ids or set()
             ) and _global_has_composer(session, rec.composer_id):
                 continue
-        seen.add(key)
-        # No local workspace registered this CID for this origin. Do not
-        # consult the global composer: it may belong to another project.
-        if rec.invalid_origin:
-            relation = SyncRelation.UNKNOWN
-        else:
-            try:
-                index.ensure_remote_readable(rec)
-            except ClassifyError:
+            seen.add(key)
+            # No local workspace registered this CID for this origin. Do not
+            # consult the global composer: it may belong to another project.
+            if rec.invalid_origin:
                 relation = SyncRelation.UNKNOWN
             else:
-                relation = SyncRelation.BEHIND
-        if target_workspace is not None:
-            remote_ws_dir = target_workspace.get("workspace_dir")
-            remote_path = target_workspace.get("path") or ""
-            remote_host = target_workspace.get("host")
-        else:
-            remote_ws_dir = None
-            remote_path = rec.meta.get("sourceProjectPath") or ""
-            remote_host = rec.meta.get("sourceHost")
-        plan.items.append(
-            PlannedItem(
-                composer_id=rec.composer_id,
-                relation=relation,
-                name=rec.meta.get("name") or "Untitled",
-                snapshot_path=rec.path,
-                meta=rec.meta,
-                workspace_dir=remote_ws_dir,
-                project_path=remote_path,
-                source_host=remote_host,
-                project_identifier=rec.project_identifier,
+                try:
+                    index.ensure_remote_readable(rec)
+                except ClassifyError:
+                    relation = SyncRelation.UNKNOWN
+                else:
+                    relation = SyncRelation.BEHIND
+            if target_workspace is not None:
+                remote_ws_dir = target_workspace.get("workspace_dir")
+                remote_path = target_workspace.get("path") or ""
+                remote_host = target_workspace.get("host")
+            else:
+                remote_ws_dir = None
+                remote_path = rec.meta.get("sourceProjectPath") or ""
+                remote_host = rec.meta.get("sourceHost")
+            plan.items.append(
+                PlannedItem(
+                    composer_id=rec.composer_id,
+                    relation=relation,
+                    name=rec.meta.get("name") or "Untitled",
+                    snapshot_path=rec.path,
+                    meta=rec.meta,
+                    workspace_dir=remote_ws_dir,
+                    project_path=remote_path,
+                    source_host=remote_host,
+                    project_identifier=rec.project_identifier,
+                )
             )
-        )
+        finally:
+            session.release_composer_cell(rec.composer_id)
     index.cache.flush()
     session.cache.flush()
     return plan
@@ -1398,9 +1554,10 @@ def _global_has_composer(session: SyncReadSession, composer_id: str) -> bool:
     if session._inventory_complete:
         return session.raw_fingerprint(composer_id) is not None
     try:
-        return session.composer_data(composer_id) is not None
-    except Exception:
+        present, _ = session.composer_cell(composer_id)
+    except ClassifyError:
         return True
+    return present
 
 
 def _candidate_content_digest(rec: SnapshotRecord) -> str:
@@ -1425,6 +1582,10 @@ def capture_local_guard(
     """
     if not expect_present:
         return LocalGuard(expect_present=False, expect_in_target=expect_in_target)
+    # DANGLING (registration, no composerData row) + snapshot is BEHIND
+    # in the sync planner, but there is no local row to fingerprint.
+    # Fail closed here: UNKNOWN/SKIP. Restoring that case is separate
+    # from treating empty shells as not-pushed.
     row_fp = session.raw_fingerprint(composer_id)
     if not row_fp:
         return None
@@ -1605,73 +1766,82 @@ def build_pull_plan(
         if not _record_matches_target(rec, target_workspace):
             continue
         snapshot_cids.add(rec.composer_id)
-
-        if rec.invalid_origin:
-            relation = PullRelation.UNKNOWN
-        elif rec.composer_id not in target_ids:
-            if _global_has_composer(session, rec.composer_id):
-                relation = PullRelation.GLOBAL_COLLISION
+        try:
+            if rec.invalid_origin:
+                relation = PullRelation.UNKNOWN
+            elif rec.composer_id not in target_ids:
+                if _global_has_composer(session, rec.composer_id):
+                    relation = PullRelation.GLOBAL_COLLISION
+                else:
+                    try:
+                        index.ensure_remote_readable(rec)
+                    except ClassifyError:
+                        relation = PullRelation.UNKNOWN
+                    else:
+                        relation = PullRelation.MISSING_LOCAL
             else:
                 try:
-                    index.ensure_remote_readable(rec)
+                    sync_rel = classify_conversation(
+                        session,
+                        index,
+                        rec.composer_id,
+                        project_identifier=rec.project_identifier,
+                        source_host=source_host,
+                        source_path=project_path,
+                        workspace=target_workspace,
+                    )
                 except ClassifyError:
+                    sync_rel = SyncRelation.UNKNOWN
+                relation = _SYNC_TO_PULL.get(sync_rel, PullRelation.UNKNOWN)
+
+            action = _pull_action(relation, restore_all)
+            content_digest = ""
+            local_guard = None
+            if action == PullAction.IMPORT:
+                try:
+                    content_digest = _candidate_content_digest(rec)
+                except OSError:
                     relation = PullRelation.UNKNOWN
-                else:
-                    relation = PullRelation.MISSING_LOCAL
-        else:
-            try:
-                sync_rel = classify_conversation(
+                    action = PullAction.SKIP
+            if action == PullAction.IMPORT:
+                present = relation != PullRelation.MISSING_LOCAL
+                local_guard = capture_local_guard(
                     session,
-                    index,
                     rec.composer_id,
-                    project_identifier=rec.project_identifier,
-                    source_host=source_host,
-                    source_path=project_path,
-                    workspace=target_workspace,
+                    expect_present=present,
+                    expect_in_target=present,
                 )
-            except ClassifyError:
-                sync_rel = SyncRelation.UNKNOWN
-            relation = _SYNC_TO_PULL.get(sync_rel, PullRelation.UNKNOWN)
+                if local_guard is None:
+                    relation = PullRelation.UNKNOWN
+                    action = PullAction.SKIP
 
-        action = _pull_action(relation, restore_all)
-        content_digest = ""
-        local_guard = None
-        if action == PullAction.IMPORT:
-            try:
-                content_digest = _candidate_content_digest(rec)
-            except OSError:
-                relation = PullRelation.UNKNOWN
-                action = PullAction.SKIP
-        if action == PullAction.IMPORT:
-            present = relation != PullRelation.MISSING_LOCAL
-            local_guard = capture_local_guard(
-                session,
-                rec.composer_id,
-                expect_present=present,
-                expect_in_target=present,
+            item = PullItem(
+                composer_id=rec.composer_id,
+                relation=relation,
+                action=action,
+                name=rec.meta.get("name") or "Untitled",
+                snapshot_path=rec.path,
+                meta=rec.meta,
+                workspace_dir=ws_dir,
+                project_path=project_path,
+                source_host=source_host,
+                project_identifier=rec.project_identifier,
+                classified_identity=rec.identity,
+                classified_content_digest=content_digest,
+                local_guard=local_guard,
             )
-            if local_guard is None:
-                relation = PullRelation.UNKNOWN
-                action = PullAction.SKIP
+            plan.items.append(item)
+        finally:
+            session.release_composer_cell(rec.composer_id)
 
-        item = PullItem(
-            composer_id=rec.composer_id,
-            relation=relation,
-            action=action,
-            name=rec.meta.get("name") or "Untitled",
-            snapshot_path=rec.path,
-            meta=rec.meta,
-            workspace_dir=ws_dir,
-            project_path=project_path,
-            source_host=source_host,
-            project_identifier=rec.project_identifier,
-            classified_identity=rec.identity,
-            classified_content_digest=content_digest,
-            local_guard=local_guard,
-        )
-        plan.items.append(item)
-
-    plan.never_pushed = len(target_ids - snapshot_cids)
+    never_pushed = 0
+    for cid in target_ids - snapshot_cids:
+        try:
+            if classify_local_conversation(session, cid) == LocalPresence.ACTIVE:
+                never_pushed += 1
+        finally:
+            session.release_composer_cell(cid)
+    plan.never_pushed = never_pushed
     _counts.pull_candidates += len(plan.import_candidates)
     index.cache.flush()
     session.cache.flush()
