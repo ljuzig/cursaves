@@ -187,6 +187,10 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
                 if presence == syncstate.LocalPresence.INVALID:
                     counts["unknown"] += 1
                     continue
+                if presence == syncstate.LocalPresence.NULL_TOMBSTONE:
+                    if session.typed_row(cid) is not None:
+                        counts["unknown"] += 1
+                    continue
                 if syncstate.is_inactive_registration(presence, rec is not None):
                     continue
             status = get_push_status_for_conversation(
@@ -1636,6 +1640,10 @@ def cmd_status(args):
             1
             for cid in registered
             if session.local_presence(cid) == syncstate.LocalPresence.INVALID
+            or (
+                session.local_presence(cid) == syncstate.LocalPresence.NULL_TOMBSTONE
+                and session.typed_row(cid) is not None
+            )
         )
 
         only_local = local_ids - snapshot_ids
