@@ -99,8 +99,8 @@ def _count_snapshots(monkeypatch):
 
 
 def test_digest_and_cache_versions_unchanged():
-    assert syncstate.SEMANTIC_DIGEST_VERSION == 4
-    assert syncstate._CACHE_VERSION == 5
+    assert syncstate.SEMANTIC_DIGEST_VERSION == 5
+    assert syncstate._CACHE_VERSION == 6
 
 
 def test_hash_selector_full_and_unique_prefix(tmp_path, monkeypatch):

@@ -13,9 +13,9 @@ The cache is never authoritative when missing or stale. Snapshot files
 are never rewritten.
 
 A header with no bubble body is a first-class tombstone, not an error.
-``SEMANTIC_DIGEST_VERSION`` 4 keeps that bubble-state model and adds
-legacy monolithic ``composerData.conversation`` units, namespaced so
-they cannot collide with modern header/bubble hashes. Older sidecar
+``SEMANTIC_DIGEST_VERSION`` 5 keeps the v4 bubble-state and legacy
+conversation model and drops derived UI layout fields
+(``grouping``, ``contentHeightHint``) from header units. Older sidecar
 digests are never trusted; the snapshot is deep-read and the
 regenerable cache stores the current version.
 """
@@ -75,9 +75,13 @@ _TOP_LEVEL_TRANSPORT_KEYS = frozenset({
 
 _EXPLICIT_BLOB_KEYS = frozenset({"contentHash", "blobId", "contentHashes"})
 
-_CACHE_VERSION = 5
+_CACHE_VERSION = 6
 LOCAL_PAYLOAD_VERSION = 1
-SEMANTIC_DIGEST_VERSION = 4
+SEMANTIC_DIGEST_VERSION = 5
+_NON_SEMANTIC_HEADER_KEYS = frozenset({
+    "grouping",
+    "contentHeightHint",
+})
 _LEGACY_CONVERSATION_SCHEMA = "legacy-conversation"
 _HASH_CHUNK = 1024 * 1024
 
@@ -245,12 +249,15 @@ def _required_blob_ids(payload: Any, available: set[str]) -> list[str]:
 def _semantic_header(header: dict) -> dict:
     """Header fields that participate in the digest.
 
-    ``grouping`` is derived UI/tool-render metadata. Only this key is
-    dropped — other header fields stay semantic.
+    ``grouping`` and ``contentHeightHint`` are derived UI/layout
+    metadata recalculated when a chat is opened. Other header fields
+    stay semantic.
     """
-    cleaned = dict(header)
-    cleaned.pop("grouping", None)
-    return cleaned
+    return {
+        key: value
+        for key, value in header.items()
+        if key not in _NON_SEMANTIC_HEADER_KEYS
+    }
 
 
 def _unit_payload(header: dict, bubble: Optional[dict], blobs: dict[str, Any]) -> dict[str, Any]:
