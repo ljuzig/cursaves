@@ -92,6 +92,33 @@ def test_classify_local_payload_matrix():
         syncstate.classify_local_payload({"fullConversationHeadersOnly": {}})
         == syncstate.LocalPresence.INVALID
     )
+    assert (
+        syncstate.classify_local_payload(
+            {"conversation": [{"bubbleId": "b1", "text": "hi"}]}
+        )
+        == syncstate.LocalPresence.ACTIVE
+    )
+    assert (
+        syncstate.classify_local_payload({"conversation": []})
+        == syncstate.LocalPresence.EMPTY
+    )
+    assert (
+        syncstate.classify_local_payload({"conversation": None})
+        == syncstate.LocalPresence.INVALID
+    )
+    assert (
+        syncstate.classify_local_payload({"conversation": {}})
+        == syncstate.LocalPresence.INVALID
+    )
+    assert (
+        syncstate.classify_local_payload(
+            {
+                "fullConversationHeadersOnly": None,
+                "conversation": [{"bubbleId": "b1", "text": "hi"}],
+            }
+        )
+        == syncstate.LocalPresence.INVALID
+    )
 
 
 def test_ippotrack_status_counts_active_only(sync_env, monkeypatch, capsys):

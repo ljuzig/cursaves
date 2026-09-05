@@ -126,12 +126,14 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
 
     # Fallback: read full snapshot (slow for large files)
     try:
+        from . import syncstate
+
         data = read_snapshot_file(snapshot_path)
         cd = data.get("composerData", {})
         return {
             "composerId": data.get("composerId"),
             "name": cd.get("name"),
-            "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+            "messageCount": syncstate.semantic_message_count(cd),
             "exportedAt": data.get("exportedAt"),
             "sourceMachine": data.get("sourceMachine"),
             "sourceHost": data.get("sourceHost"),
@@ -281,6 +283,28 @@ def _check_conflict(
         return "incoming_newer"
 
 
+def _incoming_is_legacy_composer(composer_data: Any) -> bool:
+    """True when the snapshot uses monolithic ``conversation``, not headers."""
+    return (
+        isinstance(composer_data, dict)
+        and "fullConversationHeadersOnly" not in composer_data
+        and "conversation" in composer_data
+    )
+
+
+def _local_composer_presence(global_db_path: Path, composer_id: str):
+    """Classify an existing local composerData cell, or None if absent."""
+    from . import syncstate
+
+    if not global_db_path.exists():
+        return None
+    with db.CursorDB(global_db_path) as cdb:
+        data = cdb.get_json(f"composerData:{composer_id}")
+    if data is None:
+        return None
+    return syncstate.classify_local_payload(data)
+
+
 def import_snapshot(
     snapshot_path: Path,
     target_project_path: str,
@@ -326,12 +350,24 @@ def import_snapshot(
 
     composer_data = snapshot["composerData"]
 
-    # Skip empty conversations (new-but-never-used chats)
-    headers = composer_data.get("fullConversationHeadersOnly", [])
-    if not headers and not composer_data.get("name"):
+    from . import syncstate
+
+    presence = syncstate.classify_local_payload(composer_data)
+    if presence == syncstate.LocalPresence.INVALID:
+        if not quiet:
+            print(
+                f"  Skipping unreadable conversation {composer_id[:12]}...",
+                file=sys.stderr,
+            )
+        return False
+    if presence == syncstate.LocalPresence.EMPTY and not composer_data.get("name"):
         if not quiet:
             print(f"  Skipping empty conversation {composer_id[:12]}...")
         return True  # Not an error, just nothing to import
+
+    headers = composer_data.get("fullConversationHeadersOnly") or []
+    if not isinstance(headers, list):
+        headers = []
 
     # Rewrite paths if the project is at a different location
     if source_path and source_path != target_path:
@@ -357,6 +393,15 @@ def import_snapshot(
     if skip_conflict:
         conflict = "incoming_newer"
     else:
+        if _incoming_is_legacy_composer(composer_data):
+            local_presence = _local_composer_presence(global_db_path, composer_id)
+            if local_presence == syncstate.LocalPresence.ACTIVE:
+                print(
+                    f"  Refused: \"{chat_name}\" — a local active conversation "
+                    f"already exists; classify with sync before overwriting.",
+                    file=sys.stderr,
+                )
+                return False
         conflict = _check_conflict(
             global_db_path, composer_id, incoming_bubble_ids, incoming_header_ids,
         )
