@@ -212,7 +212,7 @@ def test_v3_legacy_sidecar_is_not_trusted_after_digest_bump(sync_env):
     assert syncstate.op_counts().deep_snapshot_reads == 1
     cache = json.loads((sync_env["tmp"] / "cache" / "sync-semantics.json").read_text())
     stored = next(iter(cache["snapshots"].values()))
-    assert stored["semanticDigestVersion"] == 4
+    assert stored["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
     assert stored["semanticDigest"] != syncstate.conversation_digest([])
 
 
@@ -264,7 +264,7 @@ def test_snapshot_sidecar_uses_conversation_length(tmp_path, monkeypatch):
     export.save_snapshot(snap, tmp_path)
     meta = json.loads((tmp_path / "project" / f"{CID_A}.meta.json").read_text())
     assert meta["messageCount"] == 3
-    assert meta["semanticDigestVersion"] == 4
+    assert meta["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
 
 
 def test_sync_with_identical_legacy_is_not_unsafe(sync_env, monkeypatch):
