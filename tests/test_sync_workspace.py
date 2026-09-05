@@ -47,7 +47,8 @@ def _ws(ws_dir: Path, path: str, host: str | None = None) -> dict:
 
 def _use_workspaces(monkeypatch, workspaces: list[dict]) -> list[dict]:
     listed = list(workspaces)
-    monkeypatch.setattr(paths, "list_workspaces_with_conversations", lambda: listed)
+    monkeypatch.setattr(paths, "list_workspaces_with_conversations", lambda *a, **k: listed)
+    monkeypatch.setattr(paths, "list_all_workspaces", lambda: listed)
     return listed
 
 
