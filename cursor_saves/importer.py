@@ -5,10 +5,11 @@ import json
 import os
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from . import db, paths
+from . import db, paths, typed_headers
 from .process import is_cursor_running
 
 
@@ -415,11 +416,25 @@ def import_snapshot(
                 f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
                 f"snapshot has {snap_count} (local is newer, nothing to import)"
             )
-            return True
+            return _repair_typed_after_content_noop(
+                composer_id,
+                chat_name,
+                target_path,
+                target_workspace_dir,
+                skip_backup=skip_backup,
+                quiet=quiet,
+            )
 
         if conflict == "identical":
             print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
-            return True
+            return _repair_typed_after_content_noop(
+                composer_id,
+                chat_name,
+                target_path,
+                target_workspace_dir,
+                skip_backup=skip_backup,
+                quiet=quiet,
+            )
 
         if conflict == "new" and not quiet:
             print(f"  New chat: \"{chat_name}\" ({len(headers)} msgs from {source_label})")
@@ -450,16 +465,34 @@ def import_snapshot(
                 f"            Importing as separate chat: \"{new_name}\""
             )
 
-    # ── Step 1: Backup global DB ────────────────────────────────────
+    # ── Step 1: Resolve workspace, then back up before any write ────
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+    ws_db_path = ws_dir / "state.vscdb"
+
     if not skip_backup and global_db_path.exists():
         backup_path = db.backup_db(global_db_path)
         print(f"  Backed up global DB to {backup_path.name}")
+    if not skip_backup and ws_db_path.exists():
+        backup_path = db.backup_db(ws_db_path)
+        print(f"  Backed up workspace DB to {backup_path.name}")
 
-    # ── Step 2: Write conversation data to global DB ────────────────
+    # ── Step 2–4: payload + typed header + workspace refs as one txn ─
     owned_global = global_cdb is None
+    owned_ws = workspace_cdb is None
     if owned_global:
         global_cdb = db.CursorDB(global_db_path)
+    if owned_ws:
+        workspace_cdb = db.CursorDB(ws_db_path)
+    started_txn = owned_global and owned_ws
     try:
+        if started_txn:
+            global_cdb.enable_batch_writes()
+            workspace_cdb.enable_batch_writes()
+            global_cdb.begin()
+            workspace_cdb.begin()
         _write_snapshot_to_global(
             global_cdb,
             composer_id,
@@ -472,37 +505,34 @@ def import_snapshot(
             source_path,
             target_path,
         )
+        if not _register_in_workspace(
+            composer_id,
+            composer_data,
+            ws_dir,
+            workspace_cdb=workspace_cdb,
+            global_cdb=global_cdb,
+        ):
+            if started_txn:
+                _rollback_write_pair(global_cdb, workspace_cdb)
+            return False
+        if not _verify_imported(
+            global_cdb, composer_id, bubble_entries, workspace_dir=ws_dir
+        ):
+            if started_txn:
+                _rollback_write_pair(global_cdb, workspace_cdb)
+            return False
+        if started_txn:
+            global_cdb.commit_write()
+            workspace_cdb.commit_write()
+    except Exception:
+        if started_txn:
+            _rollback_write_pair(global_cdb, workspace_cdb)
+        raise
     finally:
         if owned_global:
             global_cdb.close()
-
-    # ── Step 3: Register conversation in workspace DB ───────────────
-    if target_workspace_dir is not None:
-        ws_dir = target_workspace_dir
-    else:
-        ws_dir = find_or_create_workspace(target_path)
-    ws_db_path = ws_dir / "state.vscdb"
-
-    if not skip_backup and ws_db_path.exists():
-        backup_path = db.backup_db(ws_db_path)
-        print(f"  Backed up workspace DB to {backup_path.name}")
-
-    _register_in_workspace(
-        composer_id, composer_data, ws_dir,
-        workspace_cdb=workspace_cdb, global_cdb=global_cdb if not owned_global else None,
-    )
-
-    # ── Step 4: Verify writes ─────────────────────────────────────────
-    if owned_global:
-        verify_cdb = db.CursorDB(global_db_path)
-        try:
-            ok = _verify_imported(verify_cdb, composer_id, bubble_entries)
-        finally:
-            verify_cdb.close()
-    else:
-        ok = _verify_imported(global_cdb, composer_id, bubble_entries)
-    if not ok:
-        return False
+        if owned_ws:
+            workspace_cdb.close()
 
     if not quiet:
         written = None
@@ -523,6 +553,22 @@ def import_snapshot(
             print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
 
     return True
+
+
+def _rollback_write_pair(
+    global_cdb: Optional["db.CursorDB"],
+    workspace_cdb: Optional["db.CursorDB"],
+) -> None:
+    if global_cdb is not None:
+        try:
+            global_cdb.rollback_write()
+        except Exception:
+            pass
+    if workspace_cdb is not None:
+        try:
+            workspace_cdb.rollback_write()
+        except Exception:
+            pass
 
 
 def _write_snapshot_to_global(
@@ -584,6 +630,7 @@ def _verify_imported(
     cdb: "db.CursorDB",
     composer_id: str,
     bubble_entries: dict,
+    workspace_dir: Optional[Path] = None,
 ) -> bool:
     written = cdb.get_json(f"composerData:{composer_id}")
     if not written:
@@ -594,6 +641,21 @@ def _verify_imported(
         sample = cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
         if not sample:
             print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
+            return False
+    conn = cdb._write_conn if cdb._write_conn is not None else cdb._reader_conn()
+    if typed_headers.typed_table_usable(conn):
+        row = typed_headers.get_typed_row(conn, composer_id)
+        if row is None:
+            print(
+                "  WARNING: typed composerHeaders row missing after write!",
+                file=sys.stderr,
+            )
+            return False
+        if workspace_dir is not None and row.workspace_id != workspace_dir.name:
+            print(
+                "  WARNING: typed composerHeaders workspace does not match target!",
+                file=sys.stderr,
+            )
             return False
     return True
 
@@ -1143,14 +1205,44 @@ def import_all_snapshots(
     )
 
 
+class SafetyBackup:
+    """One global (and per-workspace) safety backup for a command mutation phase."""
+
+    def __init__(self):
+        self._global = False
+        self._ws: set[str] = set()
+
+    def global_once(self) -> None:
+        if self._global:
+            return
+        path = paths.get_global_db_path()
+        if path.exists():
+            from . import syncstate
+
+            db.backup_db(path)
+            syncstate._counts.safety_global_backups += 1
+        self._global = True
+
+    def workspace_once(self, ws_dir: Path) -> None:
+        key = str(ws_dir)
+        if key in self._ws:
+            return
+        ws_db = ws_dir / "state.vscdb"
+        if ws_db.exists():
+            from . import syncstate
+
+            db.backup_db(ws_db)
+            syncstate._counts.safety_workspace_backups += 1
+        self._ws.add(key)
+
+
 class ImportSession:
     """Reuse Cursor write connections and take safety backups once per target."""
 
-    def __init__(self):
+    def __init__(self, backup: Optional[SafetyBackup] = None):
         self._global: Optional[db.CursorDB] = None
         self._workspaces: dict[Path, db.CursorDB] = {}
-        self._global_backed_up = False
-        self._ws_backed_up: set[Path] = set()
+        self._backup = backup if backup is not None else SafetyBackup()
         self._n = 0
 
     def __enter__(self) -> "ImportSession":
@@ -1168,31 +1260,23 @@ class ImportSession:
         self._workspaces.clear()
 
     def _ensure_global(self) -> db.CursorDB:
-        from . import syncstate
-
         if self._global is None:
             path = paths.get_global_db_path()
-            if path.exists() and not self._global_backed_up:
-                db.backup_db(path)
-                syncstate._counts.safety_global_backups += 1
-                self._global_backed_up = True
+            if path.exists():
+                self._backup.global_once()
             self._global = db.CursorDB(path)
             self._global.enable_batch_writes()
         return self._global
 
     def _ensure_workspace(self, ws_dir: Path) -> db.CursorDB:
-        from . import syncstate
-
         if ws_dir not in self._workspaces:
             ws_db = ws_dir / "state.vscdb"
             existed = ws_db.exists()
             if not existed:
                 ws_dir.mkdir(parents=True, exist_ok=True)
                 _init_workspace_db(ws_db)
-            if existed and ws_dir not in self._ws_backed_up:
-                db.backup_db(ws_db)
-                syncstate._counts.safety_workspace_backups += 1
-                self._ws_backed_up.add(ws_dir)
+            if existed:
+                self._backup.workspace_once(ws_dir)
             cdb = db.CursorDB(ws_db)
             cdb.enable_batch_writes()
             self._workspaces[ws_dir] = cdb
@@ -1342,6 +1426,16 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     return {"id": ws_hash, "uri": uri_obj}
 
 
+def _legacy_header_entry(cdb: "db.CursorDB", composer_id: str) -> Optional[dict]:
+    headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
+    if not isinstance(headers, dict):
+        return None
+    for entry in headers.get("allComposers") or []:
+        if isinstance(entry, dict) and entry.get("composerId") == composer_id:
+            return entry
+    return None
+
+
 def _register_in_global_headers(
     composer_id: str,
     composer_data: dict,
@@ -1349,10 +1443,9 @@ def _register_in_global_headers(
     *,
     global_cdb: Optional["db.CursorDB"] = None,
 ) -> None:
-    """Register a conversation in the global composer.composerHeaders index.
+    """Register a conversation in the legacy JSON composer.composerHeaders index.
 
-    This is the Cursor 3.0+ central index that maps chats to workspaces.
-    Safe to call on any Cursor version — creates the index if absent.
+    Used only when the typed ``composerHeaders`` table is absent.
     """
     owned = global_cdb is None
     if owned:
@@ -1377,6 +1470,80 @@ def _register_in_global_headers(
             global_cdb.close()
 
 
+def _register_current_header(
+    composer_id: str,
+    composer_data: dict,
+    ws_dir: Path,
+    *,
+    is_migrated: bool,
+    global_cdb: Optional["db.CursorDB"] = None,
+    update_stable: bool = True,
+) -> None:
+    """Write the current-generation header (typed table, else legacy JSON)."""
+    owned = global_cdb is None
+    global_db = paths.get_global_db_path()
+    if owned:
+        if not global_db.exists() and not is_migrated:
+            return
+        global_cdb = db.CursorDB(global_db)
+    try:
+        conn = global_cdb._reader_conn()
+        status = typed_headers.assert_typed_schema_writable(conn)
+        if status == typed_headers.TypedSchemaStatus.USABLE:
+            typed_headers.register_current(
+                global_cdb,
+                composer_id,
+                ws_dir.name,
+                composer_data,
+                workspace_identifier=_build_workspace_identifier(ws_dir),
+                legacy_header=_legacy_header_entry(global_cdb, composer_id),
+                update_stable=update_stable,
+                known_checkpoint_time=composer_data.get(
+                    "conversationCheckpointLastUpdatedAt"
+                ),
+            )
+            paths.invalidate_headers_cache()
+            return
+        if is_migrated:
+            _register_in_global_headers(
+                composer_id, composer_data, ws_dir, global_cdb=global_cdb,
+            )
+    finally:
+        if owned:
+            global_cdb.close()
+
+
+def _register_workspace_refs(
+    composer_id: str,
+    composer_data: dict,
+    existing: dict,
+    *,
+    is_migrated: bool,
+) -> dict:
+    """Update selected/focused/allComposers on the workspace composerData blob."""
+    if not is_migrated:
+        all_composers = existing.get("allComposers", [])
+        existing_ids = {c.get("composerId") for c in all_composers}
+        if composer_id not in existing_ids:
+            entry = _build_composer_header_entry(composer_id, composer_data)
+            all_composers.append(entry)
+            existing["allComposers"] = all_composers
+
+    selected = existing.get("selectedComposerIds", [])
+    if composer_id not in selected:
+        selected.append(composer_id)
+        existing["selectedComposerIds"] = selected
+
+    if "lastFocusedComposerIds" in existing:
+        focused = existing["lastFocusedComposerIds"]
+        if composer_id not in focused:
+            focused.append(composer_id)
+
+    existing.setdefault("hasMigratedComposerData", True)
+    existing.setdefault("hasMigratedMultipleComposers", True)
+    return existing
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
@@ -1388,11 +1555,8 @@ def _register_in_workspace(
     """Register a conversation in a workspace's sidebar.
 
     The conversation data must already exist in the global DB.
-    Handles both Cursor 2.x (allComposers) and 3.0+ schemas.
-
-    For Cursor 3.0+, writes to the global composer.composerHeaders
-    index (the authoritative source) and the workspace's
-    selectedComposerIds.
+    Current header goes to the typed table when it exists, otherwise
+    to the legacy JSON index on migrated workspaces.
     """
     ws_db_path = ws_dir / "state.vscdb"
     owned_ws = workspace_cdb is None
@@ -1404,39 +1568,17 @@ def _register_in_workspace(
             existing = {"selectedComposerIds": []}
 
         is_migrated = "allComposers" not in existing
-
-        if not is_migrated:
-            # Cursor 2.x: write to allComposers
-            all_composers = existing.get("allComposers", [])
-            existing_ids = {c.get("composerId") for c in all_composers}
-
-            if composer_id not in existing_ids:
-                entry = _build_composer_header_entry(composer_id, composer_data)
-                all_composers.append(entry)
-                existing["allComposers"] = all_composers
-
-        # Both schemas: add to selectedComposerIds
-        selected = existing.get("selectedComposerIds", [])
-        if composer_id not in selected:
-            selected.append(composer_id)
-            existing["selectedComposerIds"] = selected
-
-        if "lastFocusedComposerIds" in existing:
-            focused = existing["lastFocusedComposerIds"]
-            if composer_id not in focused:
-                focused.append(composer_id)
-
-        existing.setdefault("hasMigratedComposerData", True)
-        existing.setdefault("hasMigratedMultipleComposers", True)
-
+        _register_current_header(
+            composer_id,
+            composer_data,
+            ws_dir,
+            is_migrated=is_migrated,
+            global_cdb=global_cdb,
+        )
+        existing = _register_workspace_refs(
+            composer_id, composer_data, existing, is_migrated=is_migrated
+        )
         workspace_cdb.write_json("composer.composerData", existing, table="ItemTable")
-
-        # Cursor 3.0+: register in the global headers index
-        if is_migrated:
-            _register_in_global_headers(
-                composer_id, composer_data, ws_dir, global_cdb=global_cdb,
-            )
-
         return True
     finally:
         if owned_ws:
@@ -1489,6 +1631,10 @@ def copy_between_workspaces(
     # Read source data and write copies
     read_cdb = db.CursorDB(global_db_path)
     write_cdb = db.CursorDB(global_db_path)
+    ws_cdb = db.CursorDB(target_db_path) if target_db_path.exists() else None
+    write_cdb.enable_batch_writes()
+    if ws_cdb is not None:
+        ws_cdb.enable_batch_writes()
     try:
         for old_id in composer_ids:
             composer_data = read_cdb.get_json(f"composerData:{old_id}")
@@ -1506,6 +1652,9 @@ def copy_between_workspaces(
 
             # Deep copy: new ID, rewrite paths, duplicate all data
             new_id = str(uuid.uuid4())
+            write_cdb.begin()
+            if ws_cdb is not None:
+                ws_cdb.begin()
 
             # Copy and transform composerData
             new_data = json.loads(json.dumps(composer_data))
@@ -1515,6 +1664,7 @@ def copy_between_workspaces(
             write_cdb.write_json(f"composerData:{new_id}", new_data)
 
             # Copy bubble entries
+            copied_bubbles: dict = {}
             bubble_keys = read_cdb.list_keys(f"bubbleId:{old_id}:")
             if bubble_keys:
                 bubble_items = []
@@ -1525,6 +1675,7 @@ def copy_between_workspaces(
                         if needs_rewrite:
                             val = rewrite_paths(val, source_norm, target_norm)
                         bubble_items.append((f"bubbleId:{new_id}:{bubble_id}", val))
+                        copied_bubbles[bubble_id] = val
                 if bubble_items:
                     write_cdb.write_json_batch(bubble_items)
 
@@ -1554,20 +1705,41 @@ def copy_between_workspaces(
                 if cp_items:
                     write_cdb.write_json_batch(cp_items)
 
-            # Register in target workspace
-            if _register_in_workspace(new_id, new_data, target_ws_dir):
-                if needs_rewrite:
-                    print(f"  Copied: {name} (paths rewritten)")
+            try:
+                if _register_in_workspace(
+                    new_id,
+                    new_data,
+                    target_ws_dir,
+                    workspace_cdb=ws_cdb,
+                    global_cdb=write_cdb,
+                ) and _verify_imported(
+                    write_cdb,
+                    new_id,
+                    copied_bubbles,
+                    workspace_dir=target_ws_dir,
+                ):
+                    write_cdb.commit_write()
+                    if ws_cdb is not None:
+                        ws_cdb.commit_write()
+                    if needs_rewrite:
+                        print(f"  Copied: {name} (paths rewritten)")
+                    else:
+                        print(f"  Copied: {name}")
+                    target_names[new_id] = name
+                    success += 1
                 else:
-                    print(f"  Copied: {name}")
-                target_names[new_id] = name
-                success += 1
-            else:
+                    _rollback_write_pair(write_cdb, ws_cdb)
+                    print(f"  Failed: {name}", file=sys.stderr)
+                    failure += 1
+            except Exception:
+                _rollback_write_pair(write_cdb, ws_cdb)
                 print(f"  Failed: {name}", file=sys.stderr)
                 failure += 1
     finally:
         read_cdb.close()
         write_cdb.close()
+        if ws_cdb is not None:
+            ws_cdb.close()
 
     return success, failure
 
@@ -1575,21 +1747,25 @@ def copy_between_workspaces(
 # ── Blob repair ──────────────────────────────────────────────────────────
 
 
-def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
-    """Scan all conversations for missing agentKv blobs and backfill from snapshots.
+@dataclass
+class BlobRepairResult:
+    conversations_fixed: int = 0
+    blobs_restored: int = 0
+    registration_errors: int = 0
 
-    Returns (conversations_repaired, blobs_restored).
-    """
+
+def repair_missing_blobs(verbose: bool = False) -> BlobRepairResult:
+    """Scan all conversations for missing agentKv blobs and backfill from snapshots."""
     import base64
     from .export import _extract_agent_blob_ids
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
-        return 0, 0
+        return BlobRepairResult()
 
     snapshots_dir = paths.get_snapshots_dir()
     if not snapshots_dir.exists():
-        return 0, 0
+        return BlobRepairResult()
 
     # Phase 1: Find conversations with missing blobs
     missing_map: dict[str, set[str]] = {}  # composerId -> set of missing blob hex IDs
@@ -1617,7 +1793,7 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     if not missing_map:
         if verbose:
             print("  No conversations with missing blobs.")
-        return 0, 0
+        return BlobRepairResult()
 
     all_missing_ids = set()
     for s in missing_map.values():
@@ -1625,6 +1801,9 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
 
     if verbose:
         print(f"  {len(missing_map)} conversation(s) with {len(all_missing_ids)} unique missing blob(s)")
+
+    with db.CursorDB(global_db_path) as probe:
+        typed_headers.assert_typed_schema_writable(probe._reader_conn())
 
     # Phase 2: Scan snapshots that contain agentBlobs (version >= 3).
     # Only decompress snapshots that might contain the missing blobs.
@@ -1673,7 +1852,7 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
         if verbose:
             still_missing = len(all_missing_ids)
             print(f"  No matching blobs found in snapshots ({still_missing} still missing)")
-        return 0, 0
+        return BlobRepairResult()
 
     # Phase 3: Write restored blobs to the global DB
     backup_path = db.backup_db(global_db_path)
@@ -1695,7 +1874,95 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     if verbose and remaining > 0:
         print(f"  {remaining} blob(s) not found in any snapshot (from conversations not yet pushed)")
 
-    return conversations_fixed, len(restored_blobs)
+    registration_errors = 0
+    if conversations_fixed:
+        _ensured, registration_errors = _ensure_typed_for_composers([
+            cid
+            for cid, missing in missing_map.items()
+            if missing & set(restored_blobs.keys())
+        ])
+
+    return BlobRepairResult(
+        conversations_fixed=conversations_fixed,
+        blobs_restored=len(restored_blobs),
+        registration_errors=registration_errors,
+    )
+
+
+def _unique_workspace_for_composer(composer_id: str) -> Optional[Path]:
+    """Workspace dir that uniquely lists *composer_id*, or None if ambiguous."""
+    matches: list[Path] = []
+    headers_map = paths._build_global_headers_map()
+    for ws in paths.list_all_workspaces():
+        ws_dir = ws["workspace_dir"]
+        ws_db = ws_dir / "state.vscdb"
+        if not ws_db.exists():
+            continue
+        ids = paths.get_workspace_composer_ids(ws_db, headers_map=headers_map)
+        if composer_id in ids:
+            matches.append(ws_dir)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _ensure_typed_for_composers(composer_ids: list[str]) -> tuple[int, int]:
+    """Header-only typed registration for already-local ACTIVE chats.
+
+    Returns ``(ensured, errors)``.
+    """
+    if not composer_ids:
+        return 0, 0
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0, 0
+    ensured = 0
+    errors = 0
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        try:
+            status = typed_headers.assert_typed_schema_writable(
+                write_cdb._reader_conn()
+            )
+        except typed_headers.TypedSchemaError as exc:
+            print(f"  ERROR: {exc}", file=sys.stderr)
+            return 0, len(composer_ids)
+        if status != typed_headers.TypedSchemaStatus.USABLE:
+            return 0, 0
+        for cid in composer_ids:
+            cd = _active_composer_data(write_cdb, cid)
+            if cd is None:
+                continue
+            legacy = _legacy_header_entry(write_cdb, cid)
+            if typed_headers.looks_like_subagent(legacy, cd, composer_id=cid):
+                continue
+            ws_dir = _unique_workspace_for_composer(cid)
+            if ws_dir is None:
+                continue
+            try:
+                result = typed_headers.register_current(
+                    write_cdb,
+                    cid,
+                    ws_dir.name,
+                    cd,
+                    workspace_identifier=_build_workspace_identifier(ws_dir),
+                    legacy_header=legacy,
+                    update_stable=False,
+                )
+            except typed_headers.MisregisteredHeaderError as exc:
+                print(f"  ERROR: {exc}", file=sys.stderr)
+                errors += 1
+                continue
+            except typed_headers.TypedSchemaError as exc:
+                print(f"  ERROR: {exc}", file=sys.stderr)
+                errors += 1
+                break
+            if result == "inserted":
+                ensured += 1
+    finally:
+        write_cdb.close()
+    paths.invalidate_headers_cache()
+    return ensured, errors
 
 
 # ── Doctor: audit and recover orphaned chats ─────────────────────────
@@ -1957,22 +2224,67 @@ def _find_best_workspace(
 # ── Migration ─────────────────────────────────────────────────────────
 
 
+def _collect_legacy_workspace_chats(
+    ws_dir: Path,
+) -> tuple[set[str], dict[str, dict]]:
+    """IDs and allComposers metadata from one workspace DB."""
+    local_ids: set[str] = set()
+    local_metadata: dict[str, dict] = {}
+    ws_db_path = ws_dir / "state.vscdb"
+    if not ws_db_path.exists():
+        return local_ids, local_metadata
+    try:
+        with db.CursorDB(ws_db_path) as cdb:
+            data = cdb.get_json("composer.composerData", table="ItemTable")
+            if not data:
+                return local_ids, local_metadata
+            for c in data.get("allComposers", []):
+                cid = c.get("composerId")
+                if cid:
+                    local_ids.add(cid)
+                    local_metadata[cid] = c
+            for cid in data.get("selectedComposerIds", []):
+                if cid:
+                    local_ids.add(cid)
+            for cid in data.get("lastFocusedComposerIds", []):
+                if cid:
+                    local_ids.add(cid)
+            for key in cdb.list_keys(
+                "workbench.panel.composerChatViewPane.", table="ItemTable"
+            ):
+                pane = cdb.get_json(key, table="ItemTable")
+                if isinstance(pane, dict):
+                    for view_key in pane:
+                        if ".view." in view_key:
+                            cid = view_key.rsplit(".", 1)[-1]
+                            if cid:
+                                local_ids.add(cid)
+    except Exception:
+        return local_ids, local_metadata
+    return local_ids, local_metadata
+
+
+def _active_composer_data(cdb: "db.CursorDB", composer_id: str) -> Optional[dict]:
+    from . import syncstate
+
+    cd = cdb.get_json(f"composerData:{composer_id}")
+    if syncstate.classify_local_payload(cd) != syncstate.LocalPresence.ACTIVE:
+        return None
+    return cd
+
+
 def migrate_to_global_headers(
     dry_run: bool = False,
     force: bool = False,
 ) -> tuple[int, int]:
-    """Migrate old chats into the Cursor 3.0 global composer.composerHeaders index.
+    """Migrate chats that are discoverable but missing from the current index.
 
-    Scans all workspaces for chats that exist in the old format (allComposers,
-    pane entries, selectedComposerIds) but are missing from the central
-    composer.composerHeaders index. Adds them with the correct
-    workspaceIdentifier so Cursor 3.0 can discover them natively.
+    When the typed ``composerHeaders`` table exists, candidates are valid
+    chats found via legacy sources (JSON headers and workspace refs) that
+    have no typed row. Apply inserts typed rows; it does not rewrite JSON.
 
-    Args:
-        dry_run: If True, only report what would be migrated without writing.
-        force: Skip the Cursor-running check.
-
-    Returns (migrated_count, already_present_count).
+    When the table is absent, behaviour matches the previous JSON-index
+    migrate (workspace leftovers → ``composer.composerHeaders``).
     """
     if not dry_run and not force and is_cursor_running():
         print(
@@ -1988,75 +2300,49 @@ def migrate_to_global_headers(
         print("Global DB not found.", file=sys.stderr)
         return 0, 0
 
-    # Read the current global headers
-    global_cdb = db.CursorDB(global_db_path)
-    try:
-        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
-    finally:
-        global_cdb.close()
+    with db.CursorDB(global_db_path) as probe:
+        conn = probe._ensure_read_copy()
+        schema = typed_headers.assert_typed_schema_writable(conn)
+        typed_exists = schema == typed_headers.TypedSchemaStatus.USABLE
+        typed_catalog = (
+            typed_headers.load_typed_catalog(conn) if typed_exists else {}
+        )
+        headers = probe.get_json("composer.composerHeaders", table="ItemTable")
     if headers is None:
         headers = {"allComposers": []}
+
+    all_ws = paths.list_all_workspaces()
+    ws_by_hash = {ws["workspace_dir"].name: ws for ws in all_ws}
+
+    if typed_exists:
+        return _migrate_typed_headers(
+            dry_run=dry_run,
+            global_db_path=global_db_path,
+            typed_catalog=typed_catalog,
+            headers=headers,
+            all_ws=all_ws,
+            ws_by_hash=ws_by_hash,
+        )
 
     existing_ids = {
         c.get("composerId") for c in headers.get("allComposers", [])
     }
-
-    # Scan all workspaces for chats not in the global index
-    all_ws = paths.list_all_workspaces()
-    to_migrate: list[tuple] = []  # (entry_or_None, cid, ws_dir, ws_identifier)
+    to_migrate: list[tuple] = []
     already_present = 0
 
     for ws in all_ws:
         ws_dir = ws["workspace_dir"]
-        ws_db_path = ws_dir / "state.vscdb"
-        if not ws_db_path.exists():
+        local_ids, local_metadata = _collect_legacy_workspace_chats(ws_dir)
+        if not local_ids:
             continue
-
-        local_ids: set[str] = set()
-        local_metadata: dict[str, dict] = {}
-
-        try:
-            with db.CursorDB(ws_db_path) as cdb:
-                data = cdb.get_json("composer.composerData", table="ItemTable")
-                if not data:
-                    continue
-
-                for c in data.get("allComposers", []):
-                    cid = c.get("composerId")
-                    if cid:
-                        local_ids.add(cid)
-                        local_metadata[cid] = c
-
-                for cid in data.get("selectedComposerIds", []):
-                    if cid:
-                        local_ids.add(cid)
-                for cid in data.get("lastFocusedComposerIds", []):
-                    if cid:
-                        local_ids.add(cid)
-
-                for key in cdb.list_keys(
-                    "workbench.panel.composerChatViewPane.", table="ItemTable"
-                ):
-                    pane = cdb.get_json(key, table="ItemTable")
-                    if isinstance(pane, dict):
-                        for view_key in pane:
-                            if ".view." in view_key:
-                                cid = view_key.rsplit(".", 1)[-1]
-                                if cid:
-                                    local_ids.add(cid)
-        except Exception:
-            continue
-
         ws_identifier = _build_workspace_identifier(ws_dir)
         for cid in local_ids:
             if cid in existing_ids:
                 already_present += 1
                 continue
-
             entry = None
             if cid in local_metadata:
                 entry = _build_composer_header_entry(cid, local_metadata[cid])
-
             to_migrate.append((entry, cid, ws_dir, ws_identifier))
             existing_ids.add(cid)
 
@@ -2064,7 +2350,6 @@ def migrate_to_global_headers(
         print(f"All chats already in global index ({already_present} checked).")
         return 0, already_present
 
-    # Fetch metadata from global DB for entries that need it, skip empty stubs
     final_entries: list[dict] = []
     with db.CursorDB(global_db_path) as read_cdb:
         for entry, cid, ws_dir, ws_identifier in to_migrate:
@@ -2078,15 +2363,12 @@ def migrate_to_global_headers(
                 entry = _build_composer_header_entry(cid, cd)
 
             entry["workspaceIdentifier"] = ws_identifier
-
             ws_label = os.path.basename(
                 ws_identifier.get("uri", {}).get("fsPath", ws_dir.name)
             )
             name = entry.get("name", "")[:40] or "(unnamed)"
-
             if dry_run:
                 print(f"  Would migrate: {cid[:12]}... \"{name}\" → {ws_label}")
-
             final_entries.append(entry)
 
     if not final_entries:
@@ -2114,6 +2396,312 @@ def migrate_to_global_headers(
     return len(final_entries), already_present
 
 
+def _migrate_typed_headers(
+    *,
+    dry_run: bool,
+    global_db_path: Path,
+    typed_catalog: dict,
+    headers: dict,
+    all_ws: list[dict],
+    ws_by_hash: dict[str, dict],
+) -> tuple[int, int]:
+    """Candidates: ACTIVE, typed-missing, unambiguous, non-subagent chats."""
+    queued: dict[str, tuple[Path, dict, Optional[dict]]] = {}
+    claims: dict[str, set[str]] = {}
+    already_present = 0
+    typed_ids = set(typed_catalog.keys())
+    counted_typed: set[str] = set()
+
+    def _claim(cid: str, ws_hash: str) -> None:
+        claims.setdefault(cid, set()).add(ws_hash)
+
+    for entry in headers.get("allComposers") or []:
+        if not isinstance(entry, dict):
+            continue
+        cid = entry.get("composerId")
+        if not cid:
+            continue
+        if cid in typed_ids:
+            if cid not in counted_typed:
+                already_present += 1
+                counted_typed.add(cid)
+            continue
+        wi = entry.get("workspaceIdentifier") or {}
+        ws_hash = wi.get("id", "")
+        ws = ws_by_hash.get(ws_hash)
+        if ws is None:
+            continue
+        _claim(cid, ws_hash)
+        queued.setdefault(
+            cid,
+            (ws["workspace_dir"], _build_workspace_identifier(ws["workspace_dir"]), entry),
+        )
+
+    for ws in all_ws:
+        ws_dir = ws["workspace_dir"]
+        local_ids, local_metadata = _collect_legacy_workspace_chats(ws_dir)
+        for cid in local_ids:
+            if cid in typed_ids:
+                if cid not in counted_typed:
+                    already_present += 1
+                    counted_typed.add(cid)
+                continue
+            _claim(cid, ws_dir.name)
+            if cid in queued:
+                continue
+            queued[cid] = (
+                ws_dir,
+                _build_workspace_identifier(ws_dir),
+                local_metadata.get(cid),
+            )
+
+    candidates: list[tuple[str, Path, dict, Optional[dict], dict]] = []
+    with db.CursorDB(global_db_path) as read_cdb:
+        for cid, (ws_dir, ws_identifier, legacy) in queued.items():
+            if len(claims.get(cid, ())) > 1:
+                continue
+            cd = _active_composer_data(read_cdb, cid)
+            if cd is None:
+                continue
+            if typed_headers.looks_like_subagent(legacy, cd, composer_id=cid):
+                continue
+            candidates.append((cid, ws_dir, ws_identifier, legacy, cd))
+            ws_label = os.path.basename(
+                ws_identifier.get("uri", {}).get("fsPath", ws_dir.name)
+            )
+            name = (cd.get("name") or (legacy or {}).get("name") or "")[:40] or "(unnamed)"
+            if dry_run:
+                print(f"  Would migrate: {cid[:12]}... \"{name}\" → {ws_label}")
+
+    if not candidates:
+        print(f"All chats already in typed index ({already_present} checked).")
+        return 0, already_present
+
+    if dry_run:
+        print(
+            f"\n{len(candidates)} chat(s) would be migrated "
+            f"({already_present} already present)."
+        )
+        return len(candidates), already_present
+
+    backup_path = db.backup_db(global_db_path)
+    print(f"Backed up global DB to {backup_path.name}")
+    migrated = 0
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        for cid, ws_dir, ws_identifier, legacy, cd in candidates:
+            try:
+                result = typed_headers.register_current(
+                    write_cdb,
+                    cid,
+                    ws_dir.name,
+                    cd,
+                    workspace_identifier=ws_identifier,
+                    legacy_header=legacy if isinstance(legacy, dict) and legacy.get("composerId") == cid else _legacy_header_entry(write_cdb, cid),
+                    update_stable=False,
+                )
+            except typed_headers.MisregisteredHeaderError as exc:
+                print(f"  Skipped: {exc}", file=sys.stderr)
+                continue
+            if result == "inserted":
+                migrated += 1
+    finally:
+        write_cdb.close()
+    paths.invalidate_headers_cache()
+    print(f"Migrated {migrated} chat(s) to typed composerHeaders.")
+    print("Restart Cursor to see them in the sidebar.")
+    return migrated, already_present
+
+
+def _repair_typed_after_content_noop(
+    composer_id: str,
+    chat_name: str,
+    target_path: str,
+    target_workspace_dir: Optional[Path],
+    *,
+    skip_backup: bool,
+    quiet: bool,
+) -> bool:
+    """Header-only repair when import content is identical or local-ahead.
+
+    Table absent → historical no-op. REGISTERED → no-op. Missing/legacy-only
+    → insert typed header. Foreign/stale/incompatible → raise.
+    Does not rewrite composerData, bubbles, or workspace selected/focused/pane.
+    """
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return True
+
+    with db.CursorDB(global_db_path) as probe:
+        status = typed_headers.typed_schema_status(probe._reader_conn())
+        if status == typed_headers.TypedSchemaStatus.ABSENT:
+            return True
+        typed_headers.assert_typed_schema_writable(probe._reader_conn())
+        cd = _active_composer_data(probe, composer_id)
+        if cd is None:
+            return True
+        legacy = _legacy_header_entry(probe, composer_id)
+        if typed_headers.looks_like_subagent(legacy, cd, composer_id=composer_id):
+            return True
+        row = typed_headers.get_typed_row(probe._reader_conn(), composer_id)
+        target_identifier = _build_workspace_identifier(ws_dir)
+        health = typed_headers.classify_registration(
+            typed_table_exists=True,
+            typed_workspace_id=row.workspace_id if row is not None else None,
+            target_workspace_id=ws_dir.name,
+            in_legacy_sources=legacy is not None,
+            typed_identifier=(
+                row.header.get("workspaceIdentifier") if row is not None else None
+            ),
+            target_identifier=target_identifier,
+        )
+        if health == typed_headers.RegistrationHealth.REGISTERED:
+            return True
+        if typed_headers.is_registration_conflict(health):
+            if row is None:
+                return True
+            binding = typed_headers.classify_workspace_binding(
+                typed_workspace_id=row.workspace_id,
+                target_workspace_id=ws_dir.name,
+                typed_identifier=row.header.get("workspaceIdentifier"),
+                target_identifier=target_identifier,
+            )
+            raise typed_headers.MisregisteredHeaderError(
+                composer_id,
+                row.workspace_id,
+                ws_dir.name,
+                binding=binding,
+            )
+        if health not in (
+            typed_headers.RegistrationHealth.MISSING,
+            typed_headers.RegistrationHealth.LEGACY_ONLY,
+        ):
+            return True
+
+    if not skip_backup:
+        backup_path = db.backup_db(global_db_path)
+        if not quiet:
+            print(f"  Backed up global DB to {backup_path.name}")
+
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        cd = _active_composer_data(write_cdb, composer_id)
+        if cd is None:
+            return True
+        legacy = _legacy_header_entry(write_cdb, composer_id)
+        result = typed_headers.register_current(
+            write_cdb,
+            composer_id,
+            ws_dir.name,
+            cd,
+            workspace_identifier=_build_workspace_identifier(ws_dir),
+            legacy_header=legacy,
+            update_stable=False,
+        )
+    finally:
+        write_cdb.close()
+    paths.invalidate_headers_cache()
+    if result == "inserted" and not quiet:
+        print(f"  Repaired Cursor registration for \"{chat_name}\"")
+    return True
+
+
+_REGISTRATION_REPAIR_RELATIONS = frozenset({
+    "up_to_date",
+    "local_ahead",
+    "never_pushed",
+})
+
+
+def registration_repair_candidates(plan) -> list:
+    """Local ACTIVE chats whose content needs no write but typed header does.
+
+    Shared by ``pull`` and ``sync``. Relation is compared by value so both
+    ``SyncRelation`` and ``PullRelation`` items qualify.
+    """
+    if not getattr(plan, "typed_table_exists", False):
+        return []
+    repairable = (
+        typed_headers.RegistrationHealth.LEGACY_ONLY,
+        typed_headers.RegistrationHealth.MISSING,
+    )
+    return [
+        item
+        for item in plan.items
+        if getattr(item.relation, "value", item.relation)
+        in _REGISTRATION_REPAIR_RELATIONS
+        and item.registration in repairable
+        and item.workspace_dir is not None
+    ]
+
+
+def plan_needs_registration_repair(plan) -> bool:
+    return bool(registration_repair_candidates(plan))
+
+
+def repair_typed_registrations(
+    plan,
+    backup: Optional[SafetyBackup] = None,
+) -> int:
+    """Insert typed headers for content-valid chats that are only legacy-listed.
+
+    Does not modify composerData or bubbles. Not a no-op: callers must
+    treat a non-zero return as a Cursor write that required a backup.
+    Used by both ``pull`` and ``sync``.
+
+    ``MisregisteredHeaderError`` and ``TypedSchemaError`` propagate so
+    the command can abort the mutation phase.
+    """
+    candidates = registration_repair_candidates(plan)
+    if not candidates:
+        return 0
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0
+
+    with db.CursorDB(global_db_path) as probe:
+        status = typed_headers.assert_typed_schema_writable(probe._reader_conn())
+        if status != typed_headers.TypedSchemaStatus.USABLE:
+            return 0
+
+    if backup is None:
+        backup = SafetyBackup()
+    backup.global_once()
+    repaired = 0
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        for item in candidates:
+            cd = _active_composer_data(write_cdb, item.composer_id)
+            if cd is None:
+                continue
+            legacy = _legacy_header_entry(write_cdb, item.composer_id)
+            if typed_headers.looks_like_subagent(
+                legacy, cd, composer_id=item.composer_id
+            ):
+                continue
+            result = typed_headers.register_current(
+                write_cdb,
+                item.composer_id,
+                item.workspace_dir.name,
+                cd,
+                workspace_identifier=_build_workspace_identifier(item.workspace_dir),
+                legacy_header=legacy,
+                update_stable=False,
+            )
+            if result == "inserted":
+                repaired += 1
+    finally:
+        write_cdb.close()
+    paths.invalidate_headers_cache()
+    return repaired
+
+
 # ── Purge ─────────────────────────────────────────────────────────────
 
 
@@ -2137,20 +2725,38 @@ def list_all_chats_with_sizes() -> list[dict]:
     # Map composerId -> workspace label using global headers
     cid_to_ws: dict[str, str] = {}
     cid_to_ws_dir: dict[str, str] = {}
-    for ws_hash, entries in headers_map.items():
+    typed_exists, typed_catalog = paths.typed_index_state()
+
+    def _label_for_hash(ws_hash: str) -> tuple[str, Optional[str]]:
         ws = ws_by_hash.get(ws_hash)
         if ws:
             label = os.path.basename(ws["path"])
             host = ws.get("host")
             if host:
                 label += f" ({host})"
-        else:
-            label = ws_hash[:12]
+            return label, str(ws["workspace_dir"])
+        return ws_hash[:12], None
+
+    typed_subagents: set[str] = set()
+    if typed_exists:
+        for cid, row in typed_catalog.items():
+            if getattr(row, "is_subagent", 0):
+                typed_subagents.add(cid)
+                continue
+            label, ws_dir_str = _label_for_hash(row.workspace_id)
+            cid_to_ws[cid] = label
+            if ws_dir_str:
+                cid_to_ws_dir[cid] = ws_dir_str
+
+    for ws_hash, entries in headers_map.items():
+        label, ws_dir_str = _label_for_hash(ws_hash)
         for e in entries:
             cid = e.get("composerId", "")
+            if not cid or cid in cid_to_ws:
+                continue
             cid_to_ws[cid] = label
-            if ws:
-                cid_to_ws_dir[cid] = str(ws["workspace_dir"])
+            if ws_dir_str:
+                cid_to_ws_dir[cid] = ws_dir_str
 
     # Also build from old allComposers in workspace DBs
     for ws in ws_by_hash.values():
@@ -2187,6 +2793,8 @@ def list_all_chats_with_sizes() -> list[dict]:
 
         for key in all_cd_keys:
             cid = key.split(":", 1)[1]
+            if cid in typed_subagents:
+                continue
             cd = gcdb.get_json(key)
             if not cd:
                 continue
@@ -2252,6 +2860,12 @@ def purge_chats(
     # Delete from global DB (cursorDiskKV)
     write_cdb = db.CursorDB(global_db_path)
     try:
+        try:
+            typed_headers.delete_typed_headers(write_cdb, composer_ids)
+        except typed_headers.TypedSchemaError as exc:
+            print(f"  ERROR: {exc}", file=sys.stderr)
+            return 0, 0
+
         for cid in composer_ids:
             keys_deleted = 0
             keys_deleted += write_cdb.delete_keys([f"composerData:{cid}"])
