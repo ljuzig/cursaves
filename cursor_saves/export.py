@@ -3,6 +3,7 @@
 import gzip
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from . import db, dblock, paths
 def get_workspace_conversations(
     project_path: str,
     workspace_dir: Optional[Path] = None,
+    session=None,
 ) -> list[dict]:
     """Get the list of conversations for a project.
 
@@ -24,7 +26,8 @@ def get_workspace_conversations(
     Combines global headers index (Cursor 3.0+), workspace DB allComposers
     (Cursor 2.x), and per-workspace pane/selection entries to build a
     complete list. Metadata for IDs only found via pane entries is fetched
-    from the global DB's composerData.
+    from the global DB's composerData. Pass *session* to reuse the
+    command's global read epoch.
     """
     if workspace_dir is not None:
         ws_dirs = [workspace_dir]
@@ -36,7 +39,7 @@ def get_workspace_conversations(
     all_conversations = []
     seen_ids: set[str] = set()
     ids_needing_metadata: list[tuple[str, str]] = []  # (composerId, ws_dir_str)
-    headers_map = paths._build_global_headers_map()
+    headers_map = paths._build_global_headers_map(session)
 
     for ws_dir in ws_dirs:
         ws_hash = ws_dir.name
@@ -94,9 +97,15 @@ def get_workspace_conversations(
 
     # Fetch metadata for IDs found only via pane/selection entries
     if ids_needing_metadata:
-        global_db = paths.get_global_db_path()
-        if global_db.exists():
-            with db.CursorDB(global_db) as cdb:
+        cdb = session.cdb if session is not None else None
+        owned = None
+        if cdb is None:
+            global_db = paths.get_global_db_path()
+            if global_db.exists():
+                owned = db.CursorDB(global_db)
+                cdb = owned
+        try:
+            if cdb is not None:
                 for cid, ws_dir_str in ids_needing_metadata:
                     cd = cdb.get_json(f"composerData:{cid}")
                     if cd:
@@ -109,6 +118,9 @@ def get_workspace_conversations(
                             "forceMode": cd.get("forceMode", ""),
                             "_workspaceDir": ws_dir_str,
                         })
+        finally:
+            if owned is not None:
+                owned.close()
 
     all_conversations.sort(
         key=lambda c: c.get("createdAt", 0), reverse=True
@@ -246,7 +258,9 @@ def list_conversations(
     Returns list of dicts with: id, name, date, mode, messageCount.
     Pass an open SyncReadSession to reuse its SQLite copy and payload cache.
     """
-    conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
+    conversations = get_workspace_conversations(
+        project_path, workspace_dir=workspace_dir, session=session
+    )
     if not conversations:
         return []
 
@@ -515,6 +529,38 @@ def _compress_snapshot(snapshot: dict) -> bytes:
     return buf.getvalue()
 
 
+def clear_snapshot_components(project_dir: Path, composer_id: str) -> None:
+    """Remove every on-disk representation of *composer_id* in *project_dir*.
+
+    Covers uncompressed JSON, a single ``.json.gz``, shards, and the
+    sidecar. Used by ``save_snapshot`` and ahead promote so a CID never
+    keeps a mix of old and new layouts.
+    """
+    uncompressed = project_dir / f"{composer_id}.json"
+    if uncompressed.exists():
+        uncompressed.unlink()
+    for old in project_dir.glob(f"{composer_id}.json.gz*"):
+        old.unlink()
+    meta = project_dir / f"{composer_id}.meta.json"
+    if meta.exists():
+        meta.unlink()
+
+
+def install_staged_snapshot(
+    dest_project: Path,
+    composer_id: str,
+    staged_project: Path,
+) -> None:
+    """Replace dest files for *composer_id* with exactly the staged set."""
+    dest_project.mkdir(parents=True, exist_ok=True)
+    clear_snapshot_components(dest_project, composer_id)
+    if not staged_project.is_dir():
+        return
+    for src in staged_project.iterdir():
+        if src.name.startswith(composer_id):
+            shutil.copy2(src, dest_project / src.name)
+
+
 def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     """Save a snapshot dict to a compressed JSON file.
     
@@ -537,11 +583,6 @@ def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
     project_dir.mkdir(parents=True, exist_ok=True)
 
     composer_id = snapshot["composerId"]
-    
-    # Remove old uncompressed file if it exists
-    old_file = project_dir / f"{composer_id}.json"
-    if old_file.exists():
-        old_file.unlink()
     
     # Compress and check size
     max_size = MAX_COMPRESSED_SIZE_MB * 1024 * 1024
@@ -568,11 +609,8 @@ def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
         if len(compressed) > max_size:
             snapshot["messageContexts"] = {}
             compressed = _compress_snapshot(snapshot)
-    
-    # Clean up any previous shards or single file
-    for old in project_dir.glob(f"{composer_id}.json.gz*"):
-        if not old.name.endswith(".meta.json"):
-            old.unlink()
+
+    clear_snapshot_components(project_dir, composer_id)
 
     # Save snapshot (shard if too large for GitHub)
     snapshot_file = project_dir / f"{composer_id}.json.gz"
@@ -653,24 +691,30 @@ def _checkpoint_project_unlocked(
 ) -> list[Path]:
     t0 = time.time()
     print("  Fetching workspace conversations...", file=sys.stderr, flush=True)
-    conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
-    print(f"  Found {len(conversations)} conversation(s) in workspace(s)", file=sys.stderr, flush=True)
-
-    # Filter to selected ids and count how many we'll actually process
-    to_process: list[tuple[dict, str]] = []
-    for c in conversations:
-        composer_id: str | None = c.get("composerId")
-        if not composer_id:
-            continue
-        if composer_ids is not None and composer_id not in composer_ids:
-            continue
-        to_process.append((c, composer_id))
-
     from . import syncstate
+
     last_log_time = t0
     saved = []
-    print(f"  Processing {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
     with syncstate.SyncReadSession() as session:
+        conversations = get_workspace_conversations(
+            project_path, workspace_dir=workspace_dir, session=session
+        )
+        print(
+            f"  Found {len(conversations)} conversation(s) in workspace(s)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        to_process: list[tuple[dict, str]] = []
+        for c in conversations:
+            composer_id: str | None = c.get("composerId")
+            if not composer_id:
+                continue
+            if composer_ids is not None and composer_id not in composer_ids:
+                continue
+            to_process.append((c, composer_id))
+
+        print(f"  Processing {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
         for i, (c, composer_id) in enumerate(to_process, 1):
             try:
                 if session.local_presence(composer_id) != syncstate.LocalPresence.ACTIVE:

@@ -482,7 +482,7 @@ def test_sync_releases_sqlite_before_repo(sqlite_lock, tmp_path, monkeypatch):
 
     monkeypatch.setattr(db, "finish_cursor_writes", tracking_finish)
     monkeypatch.setattr(cli, "_pull_behind", fake_pull_behind)
-    monkeypatch.setattr(cli, "_push_ahead", fake_push_ahead)
+    monkeypatch.setattr(cli, "_finish_sync_push", fake_push_ahead)
     monkeypatch.setattr(cli, "_require_sync_repo", lambda: tmp_path)
     monkeypatch.setattr(cli.paths, "get_snapshots_dir", lambda: tmp_path / "snapshots")
     monkeypatch.setattr(cli.paths, "get_sync_dir", lambda: tmp_path)
@@ -508,7 +508,7 @@ def test_sync_source_releases_before_push():
     import inspect
 
     src = inspect.getsource(cli.cmd_sync)
-    assert src.index("finish_cursor_writes") < src.index("_push_ahead")
+    assert src.index("finish_cursor_writes") < src.index("_finish_sync_push")
 
 
 def test_command_lock_audit_documented():

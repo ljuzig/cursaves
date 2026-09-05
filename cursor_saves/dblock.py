@@ -17,8 +17,9 @@ Forbidden: ``sqlite lock → repo.lock`` (raises ``LockOrderError``).
 Command audit (no path may acquire repo.lock while the sqlite write
 lock is held, unless repo.lock was already owned first):
 
-* ``sync`` — Cursor writes during pull-behind, then
-  ``finish_cursor_writes()``, then repo for checkpoint/push.
+* ``sync`` — stage ahead exports (repo, no sqlite write lock),
+  Cursor writes during pull-behind, then ``finish_cursor_writes()``,
+  then repo to promote staged snapshots and push.
 * ``pull`` — repo (local snapshot-tree / backend pull) then Cursor
   writes; no later repo.
 * ``push`` / ``watch`` / ``checkpoint`` — repo first, then temporary
