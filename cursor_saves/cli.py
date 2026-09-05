@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, db, dblock, export, paths, pull, syncstate
+from . import __version__, db, dblock, export, paths, pull, syncstate, typed_headers
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
     copy_between_workspaces,
@@ -30,6 +30,9 @@ from .importer import (
     pull_select_import_plan,
     reject_cross_origin_import,
     resolve_sync_import_targets,
+    repair_typed_registrations,
+    SafetyBackup,
+    plan_needs_registration_repair,
 )
 
 
@@ -502,12 +505,20 @@ def cmd_import(args):
 
     if args.all:
         print(f"Importing all snapshots for {project_path}...")
-        success, failure = import_all_snapshots(
-            project_path,
-            force=args.force,
-            target_workspace_dir=workspace_dir,
-            source_host=source_host,
-        )
+        try:
+            success, failure = import_all_snapshots(
+                project_path,
+                force=args.force,
+                target_workspace_dir=workspace_dir,
+                source_host=source_host,
+            )
+        except (
+            typed_headers.TypedSchemaError,
+            typed_headers.MisregisteredHeaderError,
+            typed_headers.RegistrationConflictError,
+        ) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"\nDone: {success} imported, {failure} failed.")
         if success > 0:
             _maybe_reload(args)
@@ -527,11 +538,22 @@ def cmd_import(args):
             print(origin_error, file=sys.stderr)
             sys.exit(1)
         print(f"Importing {snapshot_path.name}...")
-        if import_snapshot(
-            snapshot_path,
-            project_path,
-            target_workspace_dir=workspace_dir,
-        ):
+        if pull._cursor_running_blocks(getattr(args, "force", False)):
+            sys.exit(1)
+        try:
+            ok = import_snapshot(
+                snapshot_path,
+                project_path,
+                target_workspace_dir=workspace_dir,
+            )
+        except (
+            typed_headers.TypedSchemaError,
+            typed_headers.MisregisteredHeaderError,
+            typed_headers.RegistrationConflictError,
+        ) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if ok:
             print("Done.")
             _maybe_reload(args)
         else:
@@ -821,7 +843,7 @@ def _push_ahead_from_plan(
     backend: SyncBackend,
 ) -> int:
     """Save ahead conversations from the preflight SQLite copies, then push."""
-    if plan.unsafe:
+    if plan.unsafe or plan.registration_conflicts:
         return 0
     snapshots_dir = paths.get_snapshots_dir()
     saved = 0
@@ -960,7 +982,11 @@ def _save_sync_state(state: dict):
     state_path.write_text(json.dumps(state, indent=2))
 
 
-def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> int:
+def _pull_behind(
+    sync_dir: Path,
+    plan: Optional[syncstate.SyncPlan] = None,
+    backup: Optional[SafetyBackup] = None,
+) -> int:
     """Import conversations the preflight plan classified as behind.
 
     When *plan* is omitted a read-only plan is built first. Diverged or
@@ -970,7 +996,7 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
         with syncstate.SyncReadSession() as session:
             index = syncstate.SnapshotIndex.build()
             plan = syncstate.build_sync_plan(session, index)
-    if plan.unsafe:
+    if plan.unsafe or plan.registration_conflicts:
         return 0
 
     if plan.behind:
@@ -986,10 +1012,9 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
                 "local Cursor state changed after preflight"
             )
 
-    global_db_path = paths.get_global_db_path()
+    if backup is None:
+        backup = SafetyBackup()
     total_imported = 0
-    backed_up_global = False
-    backed_up_ws: set[str] = set()
 
     for item in plan.behind:
         snapshot = item.staged_path or item.snapshot_path
@@ -1006,15 +1031,8 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
         if not target_list:
             continue
         for ws in target_list:
-            if not backed_up_global and global_db_path.exists():
-                db.backup_db(global_db_path)
-                backed_up_global = True
-            ws_dir_str = str(ws["workspace_dir"])
-            if ws_dir_str not in backed_up_ws:
-                ws_db_path = ws["workspace_dir"] / "state.vscdb"
-                if ws_db_path.exists():
-                    db.backup_db(ws_db_path)
-                backed_up_ws.add(ws_dir_str)
+            backup.global_once()
+            backup.workspace_once(ws["workspace_dir"])
             ok = import_snapshot(
                 snapshot, ws["path"],
                 target_workspace_dir=ws["workspace_dir"],
@@ -1028,12 +1046,28 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
 
 def cmd_repair(args):
     """Repair conversations with missing agent blobs by restoring from snapshots."""
+    if pull._cursor_running_blocks(getattr(args, "force", False)):
+        return
     print("Scanning for missing blobs...")
-    fixed, restored = repair_missing_blobs(verbose=True)
-    if fixed > 0:
-        print(f"\nRepaired {fixed} conversation(s), restored {restored} blob(s).")
+    try:
+        result = repair_missing_blobs(verbose=True)
+    except typed_headers.TypedSchemaError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if result.conversations_fixed > 0:
+        print(
+            f"\nRepaired {result.conversations_fixed} conversation(s), "
+            f"restored {result.blobs_restored} blob(s)."
+        )
+        if result.registration_errors:
+            print(
+                f"ERROR: {result.registration_errors} conversation(s) restored "
+                "blobs but could not be registered in the current Cursor catalog.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print("Restart Cursor to apply fixes.")
-    elif restored == 0 and fixed == 0:
+    elif result.blobs_restored == 0 and result.conversations_fixed == 0:
         print("\nNo blobs could be restored from available snapshots.")
         print("To fix remaining conversations, re-push them from the original machine")
         print("using the latest cursaves (which exports agent blobs).")
@@ -1061,6 +1095,15 @@ def _print_sync_abort(plan: syncstate.SyncPlan) -> None:
             "\nSync stopped before importing into Cursor or creating/pushing snapshots.",
             file=sys.stderr,
         )
+
+
+def _print_registration_conflict_abort(plan: syncstate.SyncPlan) -> None:
+    print(
+        typed_headers.format_registration_conflict_abort(
+            plan.registration_conflicts, "Sync"
+        ),
+        file=sys.stderr,
+    )
 
 
 def _sync_target_workspace(args, session=None) -> Optional[dict]:
@@ -1094,8 +1137,9 @@ def cmd_sync(args):
             return
 
     # Step 2: Read-only preflight. --force does not override divergence.
-    # No snapshots means every local chat is never_pushed: skip the Cursor
-    # DB snapshot and workspace walk (nothing can be behind/ahead/diverged).
+    # An empty snapshot bucket still builds the local/registration plan so
+    # already-present ACTIVE chats can be repaired. It does not treat every
+    # local chat as a push candidate.
     # ``sync -w`` classifies only that workspace's exact origin.
     session = syncstate.SyncReadSession()
     session_entered = False
@@ -1116,22 +1160,26 @@ def cmd_sync(args):
             )
         else:
             index = syncstate.SnapshotIndex.build()
-        if index.by_key:
-            if not session_entered:
-                session.__enter__()
-                session_entered = True
-            session.cache = index.cache
-            plan = syncstate.build_sync_plan(
-                session, index, target_workspace=target_workspace
-            )
-        else:
-            plan = syncstate.SyncPlan(target_workspace=target_workspace)
+        if not session_entered:
+            session.__enter__()
+            session_entered = True
+        session.cache = index.cache
+        plan = syncstate.build_sync_plan(
+            session, index, target_workspace=target_workspace
+        )
         if plan.unsafe:
             _print_sync_abort(plan)
             sys.exit(1)
+        if plan.registration_conflicts:
+            _print_registration_conflict_abort(plan)
+            sys.exit(1)
 
         try:
-            staged = syncstate.stage_ahead_exports(plan, session)
+            staged = (
+                syncstate.stage_ahead_exports(plan, session)
+                if index.by_key
+                else None
+            )
         except syncstate.SyncPreflightStale:
             print(
                 "Sync aborted: a snapshot destination changed after preflight.\n"
@@ -1155,8 +1203,17 @@ def cmd_sync(args):
 
         # Step 3: Import — only conversations classified as behind
         print("\n── Pull ──")
+        imported = 0
+        repaired = 0
+        needs_cursor_write = bool(plan.behind) or plan_needs_registration_repair(plan)
+        if needs_cursor_write and pull._cursor_running_blocks(
+            getattr(args, "force", False)
+        ):
+            return
+        mutation_backup = SafetyBackup()
         try:
-            imported = _pull_behind(sync_dir, plan=plan)
+            imported = _pull_behind(sync_dir, plan=plan, backup=mutation_backup)
+            repaired = repair_typed_registrations(plan, backup=mutation_backup)
         except syncstate.SyncPreflightStale:
             print(
                 "Sync aborted: local Cursor state changed after preflight.\n"
@@ -1164,9 +1221,18 @@ def cmd_sync(args):
                 file=sys.stderr,
             )
             sys.exit(1)
+        except (
+            typed_headers.TypedSchemaError,
+            typed_headers.MisregisteredHeaderError,
+            typed_headers.RegistrationConflictError,
+        ) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
         if imported > 0:
             print(f"  Imported {imported} conversation(s)")
-        else:
+        if repaired > 0:
+            print(f"  Repaired Cursor registration for {repaired} conversation(s)")
+        if imported == 0 and repaired == 0:
             print("  Everything up to date")
 
         # Cursor writes from the import phase are committed and connections
@@ -1189,14 +1255,16 @@ def cmd_sync(args):
             print("  Nothing to push")
 
         print()
-        if imported > 0 or pushed > 0:
+        if imported > 0 or pushed > 0 or repaired > 0:
             parts = []
             if imported > 0:
                 parts.append(f"{imported} pulled")
+            if repaired > 0:
+                parts.append(f"{repaired} registration(s) repaired")
             if pushed > 0:
                 parts.append(f"{pushed} pushed")
             print(f"Sync complete: {', '.join(parts)}.")
-            if imported > 0:
+            if imported > 0 or repaired > 0:
                 print("Restart Cursor to see imported chats.")
         else:
             print("Already in sync.")
@@ -1411,10 +1479,18 @@ def _cmd_pull_select(args, *, force: bool, restore_all: bool) -> None:
         print("\nNo snapshots imported.")
         return
 
-    result = pull.run_multi_target_pull(
-        targets, force=force, restore_all=restore_all,
-    )
-    if result.imported > 0:
+    try:
+        result = pull.run_multi_target_pull(
+            targets, force=force, restore_all=restore_all,
+        )
+    except (
+        typed_headers.TypedSchemaError,
+        typed_headers.MisregisteredHeaderError,
+        typed_headers.RegistrationConflictError,
+    ) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if result.imported > 0 or result.repaired > 0:
         _maybe_reload(args)
 
 
@@ -1434,14 +1510,22 @@ def cmd_pull(args):
         return
 
     project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
-    result = pull.run_workspace_pull(
-        project_path,
-        target_workspace_dir=workspace_dir,
-        source_host=source_host,
-        force=force,
-        restore_all=restore_all,
-    )
-    if result.imported > 0:
+    try:
+        result = pull.run_workspace_pull(
+            project_path,
+            target_workspace_dir=workspace_dir,
+            source_host=source_host,
+            force=force,
+            restore_all=restore_all,
+        )
+    except (
+        typed_headers.TypedSchemaError,
+        typed_headers.MisregisteredHeaderError,
+        typed_headers.RegistrationConflictError,
+    ) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if result.imported > 0 or result.repaired > 0:
         _maybe_reload(args)
 
 
@@ -1558,6 +1642,68 @@ def cmd_status(args):
         only_snapshot = snapshot_ids - local_ids
         in_both = local_ids & snapshot_ids
 
+        typed_schema = session.typed_schema()
+        typed_exists = typed_schema == typed_headers.TypedSchemaStatus.USABLE
+        typed_incompatible = (
+            typed_schema == typed_headers.TypedSchemaStatus.INCOMPATIBLE
+        )
+        reg_registered = 0
+        reg_repair = 0
+        reg_misregistered = 0
+        reg_stale = 0
+        if typed_exists:
+            from .importer import _build_workspace_identifier
+
+            catalog = session.typed_catalog()
+            headers_map = session.headers_map()
+            counted: set[str] = set()
+            for ws_dir in ws_dirs:
+                if ws_dir is None:
+                    continue
+                ws_db = Path(ws_dir) / "state.vscdb"
+                if not ws_db.exists():
+                    continue
+                ws_hash = Path(ws_dir).name
+                target_identifier = _build_workspace_identifier(Path(ws_dir))
+                listed = set(
+                    paths.get_workspace_composer_ids(ws_db, session=session)
+                )
+                legacy_ids = paths._legacy_workspace_composer_ids(
+                    ws_db, ws_hash, headers_map
+                )
+                for cid in listed | legacy_ids:
+                    if cid in counted:
+                        continue
+                    counted.add(cid)
+                    row = catalog.get(cid)
+                    health = typed_headers.classify_registration(
+                        typed_table_exists=True,
+                        typed_workspace_id=(
+                            row.workspace_id if row is not None else None
+                        ),
+                        target_workspace_id=ws_hash,
+                        in_legacy_sources=row is None and cid in legacy_ids,
+                        typed_identifier=(
+                            row.header.get("workspaceIdentifier")
+                            if row is not None
+                            else None
+                        ),
+                        target_identifier=target_identifier,
+                    )
+                    if health == typed_headers.RegistrationHealth.REGISTERED:
+                        if cid in local_ids:
+                            reg_registered += 1
+                    elif health in (
+                        typed_headers.RegistrationHealth.LEGACY_ONLY,
+                        typed_headers.RegistrationHealth.MISSING,
+                    ):
+                        if cid in local_ids:
+                            reg_repair += 1
+                    elif health == typed_headers.RegistrationHealth.STALE_WORKSPACE:
+                        reg_stale += 1
+                    elif health == typed_headers.RegistrationHealth.MISREGISTERED:
+                        reg_misregistered += 1
+
         diverged = 0
         unknown = 0
         if in_both:
@@ -1578,6 +1724,21 @@ def cmd_status(args):
     print(f"  Local conversations:     {len(local_ids)}")
     print(f"  Snapshot files:          {len(snapshot_ids)}")
     print(f"  In both:                 {len(in_both)}")
+    if typed_incompatible:
+        print()
+        print(
+            "Cursor registration: composerHeaders exists but its schema "
+            "is incompatible; typed writes are disabled."
+        )
+    elif typed_exists:
+        print()
+        print("Cursor registration:")
+        print(f"  Registered:              {reg_registered}")
+        print(f"  Repair needed:           {reg_repair}")
+        if reg_stale:
+            print(f"  Stale workspace id:      {reg_stale}")
+        if reg_misregistered:
+            print(f"  Foreign workspace:       {reg_misregistered}")
     print(f"  Local only (unexported): {len(only_local)}")
     print(f"  Snapshot only (not imported): {len(only_snapshot)}")
     if diverged:
@@ -1957,10 +2118,14 @@ def cmd_migrate(args):
     else:
         print("\n  ─── Migrating chats to Cursor 3.0 global index ───────────\n")
 
-    migrated, already = migrate_to_global_headers(
-        dry_run=dry_run,
-        force=force,
-    )
+    try:
+        migrated, already = migrate_to_global_headers(
+            dry_run=dry_run,
+            force=force,
+        )
+    except typed_headers.TypedSchemaError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if not dry_run and migrated > 0:
         from .reload import print_reload_hint
@@ -2123,6 +2288,10 @@ def main():
     # ── repair ─────────────────────────────────────────────────────
     p_repair = subparsers.add_parser(
         "repair", help="Restore missing agent blobs from snapshots (fixes 'Blob not found' errors)"
+    )
+    p_repair.add_argument(
+        "--force", action="store_true",
+        help="Suppress the Cursor-running warning",
     )
     p_repair.set_defaults(func=cmd_repair)
 

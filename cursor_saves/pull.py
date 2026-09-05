@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from . import db, dblock, importer, paths, syncstate
+from . import db, dblock, importer, paths, syncstate, typed_headers
 from .process import is_cursor_running
 
 
@@ -14,6 +15,7 @@ from .process import is_cursor_running
 class PullResult:
     imported: int = 0
     failed: int = 0
+    repaired: int = 0
     plan: Optional[syncstate.PullPlan] = None
     plans: list[syncstate.PullPlan] = field(default_factory=list)
 
@@ -128,11 +130,14 @@ def _cursor_running_blocks(force: bool) -> bool:
     return False
 
 
-def _import_staged(candidates: list[syncstate.PullItem]) -> tuple[int, int]:
+def _import_staged(
+    candidates: list[syncstate.PullItem],
+    backup: Optional[importer.SafetyBackup] = None,
+) -> tuple[int, int]:
     imported = 0
     failed = 0
     try:
-        with importer.ImportSession() as batch:
+        with importer.ImportSession(backup=backup) as batch:
             for item in candidates:
                 ok = batch.import_snapshot(item)
                 if ok is True:
@@ -155,7 +160,8 @@ def run_workspace_pull(
     """Classify one origin, stage import candidates, then batch-import.
 
     No Cursor writes, backups, write lock, or running-check when there
-    is nothing to import. Backend fetch is the caller's job.
+    is nothing to import and no typed-registration repair. Backend fetch
+    is the caller's job.
     """
     return run_multi_target_pull(
         [
@@ -197,13 +203,27 @@ def run_multi_target_pull(
 
         print()
         _print_summary(plans)
+        conflicts = [
+            item
+            for plan in plans
+            for item in plan.registration_conflicts
+        ]
+        if conflicts:
+            print(
+                typed_headers.format_registration_conflict_abort(conflicts, "Pull"),
+                file=sys.stderr,
+            )
+            raise typed_headers.RegistrationConflictError(conflicts)
         candidates = [
             item
             for plan in plans
             for item in plan.import_candidates
             if item.staged_path is not None
         ]
-        if not candidates:
+        repair_needed = any(
+            importer.plan_needs_registration_repair(plan) for plan in plans
+        )
+        if not candidates and not repair_needed:
             print("Nothing to import.")
             return PullResult(plan=plans[0] if plans else None, plans=plans)
 
@@ -213,20 +233,40 @@ def run_multi_target_pull(
         n_div = sum(len(p.diverged) for p in plans)
         n_unk = sum(len(p.unknown) for p in plans)
         n_collision = sum(len(p.collisions) for p in plans)
-        print(f"Importing {len(candidates)} conversation(s)...")
-        imported, failed = _import_staged(candidates)
-        print(f"  {imported} imported")
-        if failed:
-            print(f"  {failed} failed")
-        if n_div:
-            print(f"  {n_div} diverged — skipped")
-        if n_unk:
-            print(f"  {n_unk} unknown — skipped")
-        if n_collision:
-            print(f"  {n_collision} existing elsewhere — skipped")
+        imported = 0
+        failed = 0
+        mutation_backup = importer.SafetyBackup()
+        if candidates:
+            print(f"Importing {len(candidates)} conversation(s)...")
+            imported, failed = _import_staged(candidates, backup=mutation_backup)
+            print(f"  {imported} imported")
+            if failed:
+                print(f"  {failed} failed")
+            if n_div:
+                print(f"  {n_div} diverged — skipped")
+            if n_unk:
+                print(f"  {n_unk} unknown — skipped")
+            if n_collision:
+                print(f"  {n_collision} existing elsewhere — skipped")
+
+        repaired = 0
+        try:
+            for plan in plans:
+                repaired += importer.repair_typed_registrations(
+                    plan, backup=mutation_backup
+                )
+            if repaired:
+                print(f"  Repaired Cursor registration for {repaired} conversation(s)")
+        finally:
+            db.finish_cursor_writes()
+
+        if not candidates and repaired == 0:
+            print("Nothing to import.")
+
         return PullResult(
             imported=imported,
             failed=failed,
+            repaired=repaired,
             plan=plans[0] if plans else None,
             plans=plans,
         )
