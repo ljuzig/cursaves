@@ -12,6 +12,36 @@ from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 
+class AmbiguousWorkspaceError(ValueError):
+    """More than one workspace matches an 8-character hash prefix."""
+
+    def __init__(self, selector: str, matches: list[dict]):
+        self.selector = selector
+        self.matches = matches
+        names = ", ".join(ws["workspace_dir"].name[:8] for ws in matches[:5])
+        extra = "" if len(matches) <= 5 else f" (+{len(matches) - 5} more)"
+        super().__init__(
+            f"ambiguous workspace prefix {selector!r}: {names}{extra}"
+        )
+
+
+def is_workspace_hash_selector(selector: str) -> bool:
+    """True for a full workspace hash or an 8-character hex prefix.
+
+    Short digit-only strings stay numeric (``-w 1``). A full-length
+    all-digit hash (16+ chars) is still a hash.
+    """
+    if not selector:
+        return False
+    if not all(c in "0123456789abcdefABCDEF" for c in selector):
+        return False
+    if len(selector) >= 16:
+        return True
+    if selector.isdigit():
+        return False
+    return len(selector) == 8
+
+
 def get_cursor_user_dir() -> Path:
     """Return the Cursor User data directory for the current platform.
 
@@ -259,15 +289,19 @@ def list_all_workspaces() -> list[dict]:
     return workspaces
 
 
-def get_global_composer_headers() -> list[dict]:
+def get_global_composer_headers(session=None) -> list[dict]:
     """Read the central composer.composerHeaders from the global DB.
 
     Returns the allComposers list from composer.composerHeaders in the
     global DB's ItemTable. In Cursor 3.0+ this is the authoritative
     index of all chats, each tagged with a workspaceIdentifier.
 
-    Returns an empty list if not present (pre-3.0 Cursor).
+    Pass an open SyncReadSession to reuse its read epoch. Returns an
+    empty list if not present (pre-3.0 Cursor).
     """
+    if session is not None:
+        return session.composer_headers()
+
     from . import db
 
     global_db = get_global_db_path()
@@ -286,23 +320,32 @@ def get_global_composer_headers() -> list[dict]:
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
 
 
-def _build_global_headers_map() -> dict[str, list[dict]]:
-    """Build a workspace-hash → [composer header entries] map from the global index.
-
-    Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
-    Each value is a list of composer header dicts for that workspace.
-    Cached for the lifetime of the process.
-    """
-    global _global_headers_cache
-    if _global_headers_cache is not None:
-        return _global_headers_cache
-
+def _headers_map_from_entries(entries) -> dict[str, list[dict]]:
     result: dict[str, list[dict]] = {}
-    for entry in get_global_composer_headers():
+    for entry in entries:
         wi = entry.get("workspaceIdentifier", {})
         ws_id = wi.get("id", "")
         if ws_id:
             result.setdefault(ws_id, []).append(entry)
+    return result
+
+
+def _build_global_headers_map(session=None) -> dict[str, list[dict]]:
+    """Build a workspace-hash → [composer header entries] map.
+
+    When *session* is given, the map is taken from that read epoch and
+    is not stored as a process-global cache. Without a session the
+    process cache is a convenience for write-adjacent callers, not a
+    read epoch: it is invalidated after Cursor writes.
+    """
+    if session is not None:
+        return session.headers_map()
+
+    global _global_headers_cache
+    if _global_headers_cache is not None:
+        return _global_headers_cache
+
+    result = _headers_map_from_entries(get_global_composer_headers())
     _global_headers_cache = result
     return result
 
@@ -313,7 +356,11 @@ def invalidate_headers_cache():
     _global_headers_cache = None
 
 
-def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
+def get_workspace_composer_ids(
+    ws_db_path: Path,
+    session=None,
+    headers_map: Optional[dict[str, list[dict]]] = None,
+) -> list[str]:
     """Extract all composer IDs associated with a workspace.
 
     Combines multiple sources for maximum coverage:
@@ -324,7 +371,8 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
        in the global index)
     3. Workspace DB allComposers (Cursor 2.x fallback)
 
-    Returns deduplicated IDs.
+    Returns deduplicated IDs. Pass *session* or *headers_map* to reuse
+    the command's global read epoch instead of opening another copy.
     """
     from . import db
 
@@ -332,7 +380,8 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
     ws_hash = ws_db_path.parent.name
 
     # Source 1: global headers index (Cursor 3.0+)
-    headers_map = _build_global_headers_map()
+    if headers_map is None:
+        headers_map = _build_global_headers_map(session)
     for entry in headers_map.get(ws_hash, []):
         cid = entry.get("composerId")
         if cid:
@@ -375,58 +424,71 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
     return list(ids)
 
 
-def list_workspaces_with_conversations() -> list[dict]:
+def list_workspaces_with_conversations(session=None) -> list[dict]:
     """List workspaces that have at least one conversation.
 
     Returns the same dicts as list_all_workspaces(), plus a
-    'conversations' key with the count.
+    'conversations' key with the count. Pass *session* so membership
+    reads share one global headers map.
     """
+    headers_map = _build_global_headers_map(session)
     result = []
     for ws in list_all_workspaces():
         db_path = ws["workspace_dir"] / "state.vscdb"
         if not db_path.exists():
             continue
-        composer_ids = get_workspace_composer_ids(db_path)
+        composer_ids = get_workspace_composer_ids(
+            db_path, session=session, headers_map=headers_map
+        )
         if composer_ids:
             ws["conversations"] = len(composer_ids)
             result.append(ws)
     return result
 
 
-def resolve_workspace(selector: str) -> Optional[dict]:
+def _resolve_workspace_by_hash(selector: str) -> Optional[dict]:
+    """Resolve a full hash or unique 8-character prefix via workspace.json only."""
+    matches: list[dict] = []
+    for ws in list_all_workspaces():
+        name = ws["workspace_dir"].name
+        if len(selector) == 8:
+            if name.startswith(selector):
+                matches.append(ws)
+        elif name == selector:
+            matches.append(ws)
+    if len(matches) > 1:
+        raise AmbiguousWorkspaceError(selector, matches)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def resolve_workspace(selector: str, session=None) -> Optional[dict]:
     """Resolve a workspace selector to a workspace dict.
 
     The selector can be:
       - A number (1-based index from list_workspaces_with_conversations)
       - A workspace hash (directory name under workspaceStorage/)
       - A path substring (matched against workspace paths)
-    """
-    workspaces = list_workspaces_with_conversations()
 
-    # Try as index
-    try:
+    Full hashes and 8-character prefixes use ``list_all_workspaces()``
+    and do not enumerate conversations. Ambiguous prefixes raise
+    ``AmbiguousWorkspaceError``. Numeric and substring selectors keep
+    the conversation-filtered order.
+    """
+    if is_workspace_hash_selector(selector):
+        return _resolve_workspace_by_hash(selector)
+
+    workspaces = list_workspaces_with_conversations(session=session)
+
+    if selector.isdigit():
         idx = int(selector)
         if workspaces and 1 <= idx <= len(workspaces):
             return workspaces[idx - 1]
+        if len(selector) == 8 or len(selector) >= 16:
+            return _resolve_workspace_by_hash(selector)
         return None
-    except ValueError:
-        pass
 
-    # Try as workspace hash (exact match, or prefix match when selector is 8 chars (short hash))
-    # Allow the short hash because that's what's displayed in the workspaces list,
-    # so user can just copy-paste the short hash, e.g. `cursaves push -w 497e8ab0`
-    for ws in workspaces:
-        name = ws["workspace_dir"].name
-        if len(selector) == 8:
-            # Short hash match (8 chars) - allow prefix match
-            if name.startswith(selector):
-                return ws
-        else:
-            # Exact match
-            if name == selector:
-                return ws
-
-    # Try as path substring
     for ws in workspaces:
         if selector in ws["path"]:
             return ws

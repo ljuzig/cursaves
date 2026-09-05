@@ -72,22 +72,45 @@ def _ensure_synced() -> None:
             backend.pull(snapshots_dir)
 
 
+def _lookup_workspace(selector: str, session=None) -> dict:
+    """Resolve ``-w`` or exit. Hash prefixes never enumerate conversations."""
+    try:
+        if session is None:
+            ws = paths.resolve_workspace(selector)
+        else:
+            ws = paths.resolve_workspace(selector, session=session)
+    except paths.AmbiguousWorkspaceError as exc:
+        print(
+            f"Error: Workspace prefix '{exc.selector}' is ambiguous:",
+            file=sys.stderr,
+        )
+        for match in exc.matches:
+            print(
+                f"  {match['workspace_dir'].name[:8]}  {match.get('path', '')}",
+                file=sys.stderr,
+            )
+        print("Use a longer hash or a numeric selector.", file=sys.stderr)
+        sys.exit(1)
+    if ws is None:
+        print(
+            f"Error: No workspace matching '{selector}'.\n"
+            f"Run 'cursaves workspaces' to see available workspaces.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return ws
+
+
 def _resolve_project(args) -> str:
     """Resolve the project path from --workspace, --project, or cwd."""
     if hasattr(args, "workspace") and args.workspace:
-        ws = paths.resolve_workspace(args.workspace)
-        if ws is None:
-            print(
-                f"Error: No workspace matching '{args.workspace}'.\n"
-                f"Run 'cursaves workspaces' to see available workspaces.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        return ws["path"]
+        return _lookup_workspace(args.workspace)["path"]
     return args.project if (hasattr(args, "project") and args.project) else paths.get_project_path()
 
 
-def _resolve_project_and_workspace(args) -> tuple[str, "Path | None", str | None]:
+def _resolve_project_and_workspace(
+    args, session=None
+) -> tuple[str, "Path | None", str | None]:
     """Resolve project path, workspace_dir, and host from --workspace, --project, or cwd.
 
     When -w is used, returns the specific workspace_dir so operations
@@ -95,14 +118,7 @@ def _resolve_project_and_workspace(args) -> tuple[str, "Path | None", str | None
     for SSH workspaces with the same remote path).
     """
     if hasattr(args, "workspace") and args.workspace:
-        ws = paths.resolve_workspace(args.workspace)
-        if ws is None:
-            print(
-                f"Error: No workspace matching '{args.workspace}'.\n"
-                f"Run 'cursaves workspaces' to see available workspaces.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        ws = _lookup_workspace(args.workspace, session=session)
         return ws["path"], ws["workspace_dir"], ws.get("host")
     project = args.project if (hasattr(args, "project") and args.project) else paths.get_project_path()
     return project, None, None
@@ -118,14 +134,7 @@ def _resolve_workspace_for_import(args) -> tuple[str, "Path | None"]:
     from pathlib import Path
 
     if hasattr(args, "workspace") and args.workspace:
-        ws = paths.resolve_workspace(args.workspace)
-        if ws is None:
-            print(
-                f"Error: No workspace matching '{args.workspace}'.\n"
-                f"Run 'cursaves workspaces' to see available workspaces.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        ws = _lookup_workspace(args.workspace)
         return ws["path"], ws["workspace_dir"]
 
     project_path = args.project if (hasattr(args, "project") and args.project) else paths.get_project_path()
@@ -144,7 +153,8 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
     if not db_path.exists():
         return ""
 
-    composer_ids = paths.get_workspace_composer_ids(db_path)
+    session = getattr(_workspace_sync_summary, "_session", None)
+    composer_ids = paths.get_workspace_composer_ids(db_path, session=session)
     if not composer_ids:
         return ""
 
@@ -158,7 +168,6 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
         "diverged": 0,
         "unknown": 0,
     }
-    session = getattr(_workspace_sync_summary, "_session", None)
     index = getattr(_workspace_sync_summary, "_index", None)
     for cid in composer_ids:
         try:
@@ -206,18 +215,19 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
 
 def cmd_workspaces(args):
     """List Cursor workspaces that have conversations."""
-    workspaces = paths.list_workspaces_with_conversations()
-    if not workspaces:
-        print("No workspaces with conversations found.")
-        return
-
-    print(f"{'#':<4} {'Type':<10} {'Path':<38} {'Host':<12} {'Refs':>5}  {'Hash':<9}  {'Sync Status'}")
-    print("-" * 115)
-
     session = None
+    workspaces: list[dict] = []
     try:
         session = syncstate.SyncReadSession()
         session.__enter__()
+        workspaces = paths.list_workspaces_with_conversations(session=session)
+        if not workspaces:
+            print("No workspaces with conversations found.")
+            return
+
+        print(f"{'#':<4} {'Type':<10} {'Path':<38} {'Host':<12} {'Refs':>5}  {'Hash':<9}  {'Sync Status'}")
+        print("-" * 115)
+
         index = syncstate.SnapshotIndex.build()
         _workspace_sync_summary._session = session
         _workspace_sync_summary._index = index
@@ -396,8 +406,13 @@ def cmd_init(args):
 
 def cmd_list(args):
     """List conversations for the current project."""
-    project_path, workspace_dir, _ = _resolve_project_and_workspace(args)
-    conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
+    with syncstate.SyncReadSession() as session:
+        project_path, workspace_dir, _ = _resolve_project_and_workspace(
+            args, session=session
+        )
+        conversations = export.list_conversations(
+            project_path, workspace_dir=workspace_dir, session=session
+        )
 
     if not conversations:
         print(f"No conversations found for {project_path}", file=sys.stderr)
@@ -663,7 +678,8 @@ def _select_workspace() -> tuple[str, "Path", str | None] | None:
     """
     from .interactive import select_workspace as tui_select_workspace
 
-    workspaces = paths.list_workspaces_with_conversations()
+    with syncstate.SyncReadSession() as session:
+        workspaces = paths.list_workspaces_with_conversations(session=session)
     if not workspaces:
         print("No Cursor workspaces found.")
         return None
@@ -681,7 +697,9 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
     """
     from .interactive import select_conversations as tui_select_conversations
 
-    conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
+    conversations = export.list_conversations(
+        project_path, workspace_dir=workspace_dir
+    )
     if not conversations:
         print(f"No conversations found for {project_path}")
         return []
@@ -696,7 +714,6 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
 
 def _find_ahead_conversations() -> list[dict]:
     """Scan all workspaces for conversations that are ahead of their snapshots."""
-    workspaces = paths.list_workspaces_with_conversations()
     ahead_items: list[dict] = []
 
     global_db_path = paths.get_global_db_path()
@@ -704,6 +721,7 @@ def _find_ahead_conversations() -> list[dict]:
         return ahead_items
 
     with syncstate.SyncReadSession() as session:
+        workspaces = paths.list_workspaces_with_conversations(session=session)
         index = syncstate.SnapshotIndex.build()
         for ws in workspaces:
             ws_dir = ws["workspace_dir"]
@@ -711,7 +729,7 @@ def _find_ahead_conversations() -> list[dict]:
             if not db_path.exists():
                 continue
 
-            composer_ids = paths.get_workspace_composer_ids(db_path)
+            composer_ids = paths.get_workspace_composer_ids(db_path, session=session)
             if not composer_ids:
                 continue
 
@@ -782,6 +800,20 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
             print(" failed", file=sys.stderr)
 
     return total_saved
+
+
+def _finish_sync_push(staged, backend: SyncBackend, snapshots_dir: Path) -> int:
+    """Promote preflight ahead exports after Cursor writes have been released."""
+    if staged is None:
+        return 0
+    pushed = syncstate.promote_staged_ahead(staged)
+    if backend.has_remote() and pushed:
+        print("  Pushing...", end="", flush=True)
+        if backend.push(snapshots_dir):
+            print(" done")
+        else:
+            print(" failed", file=sys.stderr)
+    return pushed
 
 
 def _push_ahead_from_plan(
@@ -942,13 +974,27 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
     if plan.unsafe:
         return 0
 
+    if plan.behind:
+        if any(
+            item.local_guard is None or item.staged_path is None
+            for item in plan.behind
+        ):
+            raise syncstate.SyncPreflightStale(
+                "behind item missing LocalGuard or staged snapshot"
+            )
+        if not syncstate.verify_behind_guards(list(plan.behind)):
+            raise syncstate.SyncPreflightStale(
+                "local Cursor state changed after preflight"
+            )
+
     global_db_path = paths.get_global_db_path()
     total_imported = 0
     backed_up_global = False
     backed_up_ws: set[str] = set()
 
     for item in plan.behind:
-        if item.snapshot_path is None:
+        snapshot = item.staged_path or item.snapshot_path
+        if snapshot is None:
             continue
         if plan.target_workspace is not None:
             target_ws = plan.target_workspace
@@ -971,7 +1017,7 @@ def _pull_behind(sync_dir: Path, plan: Optional[syncstate.SyncPlan] = None) -> i
                     db.backup_db(ws_db_path)
                 backed_up_ws.add(ws_dir_str)
             ok = import_snapshot(
-                item.snapshot_path, ws["path"],
+                snapshot, ws["path"],
                 target_workspace_dir=ws["workspace_dir"],
                 skip_backup=True,
             )
@@ -1018,11 +1064,13 @@ def _print_sync_abort(plan: syncstate.SyncPlan) -> None:
         )
 
 
-def _sync_target_workspace(args) -> Optional[dict]:
+def _sync_target_workspace(args, session=None) -> Optional[dict]:
     """Exact workspace for ``sync -w``, or None for the global plan."""
     if not getattr(args, "workspace", None):
         return None
-    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
+    project_path, workspace_dir, source_host = _resolve_project_and_workspace(
+        args, session=session
+    )
     return {
         "path": project_path,
         "workspace_dir": workspace_dir,
@@ -1050,20 +1098,30 @@ def cmd_sync(args):
     # No snapshots means every local chat is never_pushed: skip the Cursor
     # DB snapshot and workspace walk (nothing can be behind/ahead/diverged).
     # ``sync -w`` classifies only that workspace's exact origin.
-    target_workspace = _sync_target_workspace(args)
-    if target_workspace is not None:
-        index = pull.scoped_snapshot_index(
-            target_workspace["path"], target_workspace.get("host")
-        )
-    else:
-        index = syncstate.SnapshotIndex.build()
     session = syncstate.SyncReadSession()
     session_entered = False
+    staged = None
+    behind_lease = None
     try:
+        target_workspace = None
+        if getattr(args, "workspace", None):
+            if paths.is_workspace_hash_selector(args.workspace):
+                target_workspace = _sync_target_workspace(args)
+            else:
+                session.__enter__()
+                session_entered = True
+                target_workspace = _sync_target_workspace(args, session=session)
+        if target_workspace is not None:
+            index = pull.scoped_snapshot_index(
+                target_workspace["path"], target_workspace.get("host")
+            )
+        else:
+            index = syncstate.SnapshotIndex.build()
         if index.by_key:
+            if not session_entered:
+                session.__enter__()
+                session_entered = True
             session.cache = index.cache
-            session.__enter__()
-            session_entered = True
             plan = syncstate.build_sync_plan(
                 session, index, target_workspace=target_workspace
             )
@@ -1073,9 +1131,40 @@ def cmd_sync(args):
             _print_sync_abort(plan)
             sys.exit(1)
 
+        try:
+            staged = syncstate.stage_ahead_exports(plan, session)
+        except syncstate.SyncPreflightStale:
+            print(
+                "Sync aborted: a snapshot destination changed after preflight.\n"
+                "Sync stopped before importing into Cursor or creating/pushing snapshots.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if plan.behind:
+            behind_lease = db.acquire_lease("pull")
+            if not syncstate.stage_behind_snapshots(plan, behind_lease.path):
+                print(
+                    "Sync aborted: a classified snapshot changed after preflight.\n"
+                    "Sync stopped before importing into Cursor or creating/pushing snapshots.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        if session_entered:
+            session.__exit__(None, None, None)
+            session_entered = False
+
         # Step 3: Import — only conversations classified as behind
         print("\n── Pull ──")
-        imported = _pull_behind(sync_dir, plan=plan)
+        try:
+            imported = _pull_behind(sync_dir, plan=plan)
+        except syncstate.SyncPreflightStale:
+            print(
+                "Sync aborted: local Cursor state changed after preflight.\n"
+                "Sync stopped before importing into Cursor or creating/pushing snapshots.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if imported > 0:
             print(f"  Imported {imported} conversation(s)")
         else:
@@ -1086,11 +1175,17 @@ def cmd_sync(args):
         # so we never acquire repo.lock while holding sqlite (deadlock).
         db.finish_cursor_writes()
 
-        # Step 4: Push — export ahead conversations from preflight copies
+        # Step 4: Push — promote staged ahead exports, then remote push
         print("\n── Push ──")
-        pushed = _push_ahead(
-            sync_dir, auto=True, backend=backend, plan=plan, session=session
-        )
+        try:
+            pushed = _finish_sync_push(staged, backend, snapshots_dir)
+        except syncstate.SyncPreflightStale:
+            print(
+                "Sync aborted: a snapshot destination changed after preflight.\n"
+                "Sync stopped before promoting or pushing ahead exports.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if pushed == 0:
             print("  Nothing to push")
 
@@ -1109,6 +1204,10 @@ def cmd_sync(args):
     finally:
         if session_entered:
             session.__exit__(None, None, None)
+        if behind_lease is not None:
+            behind_lease.release()
+        if staged is not None and not staged.promoted:
+            staged.discard()
 
 
 def cmd_push(args):
@@ -1416,25 +1515,36 @@ def cmd_copy(args):
 def cmd_status(args):
     """Show sync status -- what's local vs what's in snapshots."""
     _ensure_synced()  # Pull latest from remote first
-    project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
-    project_id = paths.get_project_identifier(project_path, source_host=source_host)
-    snapshots_dir = paths.get_snapshots_dir() / project_id
-
-    snapshot_ids = set()
-    if snapshots_dir.exists():
-        for f in list_snapshot_files(snapshots_dir):
-            snapshot_ids.add(_get_snapshot_id(f))
-
-    registered: set[str] = set()
-    ws_dirs = [workspace_dir] if workspace_dir is not None else paths.find_workspace_dirs_for_project(project_path)
-    for ws_dir in ws_dirs:
-        if ws_dir is None:
-            continue
-        ws_db = Path(ws_dir) / "state.vscdb"
-        if ws_db.exists():
-            registered.update(paths.get_workspace_composer_ids(ws_db))
-
     with syncstate.SyncReadSession() as session:
+        project_path, workspace_dir, source_host = _resolve_project_and_workspace(
+            args, session=session
+        )
+        project_id = paths.get_project_identifier(project_path, source_host=source_host)
+        index = pull.scoped_snapshot_index(project_path, source_host)
+        found = find_snapshot_dir_for_project(
+            project_path, source_host=source_host
+        )
+        snapshots_dir = (
+            found if found is not None else paths.get_snapshots_dir() / project_id
+        )
+        snapshot_ids = {rec.composer_id for rec in index.by_key.values()}
+
+        registered: set[str] = set()
+        ws_dirs = (
+            [workspace_dir]
+            if workspace_dir is not None
+            else paths.find_workspace_dirs_for_project(project_path)
+        )
+        for ws_dir in ws_dirs:
+            if ws_dir is None:
+                continue
+            ws_db = Path(ws_dir) / "state.vscdb"
+            if ws_db.exists():
+                registered.update(
+                    paths.get_workspace_composer_ids(ws_db, session=session)
+                )
+        session.prepare_inventory(registered)
+
         local_convos = export.list_conversations(
             project_path, workspace_dir=workspace_dir, session=session
         )
@@ -1452,10 +1562,10 @@ def cmd_status(args):
         diverged = 0
         unknown = 0
         if in_both:
-            index = syncstate.SnapshotIndex.build()
+            lookup_id = index.scoped_project_identifier or project_id
             for cid in in_both:
                 rel = syncstate.classify_conversation(
-                    session, index, cid, project_identifier=project_id
+                    session, index, cid, project_identifier=lookup_id
                 )
                 if rel == syncstate.SyncRelation.DIVERGED:
                     diverged += 1
@@ -2119,6 +2229,7 @@ def main():
     )
     p_purge.set_defaults(func=cmd_purge)
 
+    db.reap_orphaned_leases()
     args = parser.parse_args()
     if not args.command:
         print(

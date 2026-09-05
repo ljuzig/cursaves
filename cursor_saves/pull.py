@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -179,7 +177,8 @@ def run_multi_target_pull(
     force: bool = False,
     restore_all: bool = False,
 ) -> PullResult:
-    staging = Path(tempfile.mkdtemp(prefix="cursaves-pull-"))
+    lease = db.acquire_lease("pull")
+    staging = lease.path
     plans: list[syncstate.PullPlan] = []
     try:
         with dblock.repo_lock():
@@ -232,4 +231,4 @@ def run_multi_target_pull(
             plans=plans,
         )
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        lease.release()

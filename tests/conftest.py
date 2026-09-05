@@ -83,6 +83,9 @@ def isolate_from_real_user_data(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("CURSAVES_REPO_LOCK", str(root / "repo.lock"))
     monkeypatch.setenv("CURSAVES_SQLITE_LOCK_TIMEOUT", "1")
     monkeypatch.setenv("CURSAVES_REPO_LOCK_TIMEOUT", "1")
+    snap_root = root / "cursaves-snapshots"
+    snap_root.mkdir()
+    monkeypatch.setenv("CURSAVES_SNAPSHOT_ROOT", str(snap_root))
 
     monkeypatch.setattr(backends, "_CONFIG_PATH", config_dir / "config.json")
 
