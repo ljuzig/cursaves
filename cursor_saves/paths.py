@@ -293,8 +293,8 @@ def get_global_composer_headers(session=None) -> list[dict]:
     """Read the central composer.composerHeaders from the global DB.
 
     Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
+    global DB's ItemTable. This is the legacy JSON index. When the
+    typed ``composerHeaders`` table exists, that table is current.
 
     Pass an open SyncReadSession to reuse its read epoch. Returns an
     empty list if not present (pre-3.0 Cursor).
@@ -318,6 +318,7 @@ def get_global_composer_headers(session=None) -> list[dict]:
 
 
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
+_global_typed_cache: Optional[tuple[bool, dict]] = None
 
 
 def _headers_map_from_entries(entries) -> dict[str, list[dict]]:
@@ -328,6 +329,29 @@ def _headers_map_from_entries(entries) -> dict[str, list[dict]]:
         if ws_id:
             result.setdefault(ws_id, []).append(entry)
     return result
+
+
+def _load_global_index_unlocked() -> None:
+    """Read JSON headers and the typed catalog from one CursorDB."""
+    global _global_headers_cache, _global_typed_cache
+    from . import db
+    from . import typed_headers
+
+    global_db = get_global_db_path()
+    if not global_db.exists():
+        _global_headers_cache = {}
+        _global_typed_cache = (False, {})
+        return
+    with db.CursorDB(global_db) as cdb:
+        headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
+        entries = []
+        if headers and isinstance(headers, dict):
+            entries = headers.get("allComposers", []) or []
+        _global_headers_cache = _headers_map_from_entries(entries)
+        conn = cdb._ensure_read_copy()
+        exists = typed_headers.typed_table_usable(conn)
+        catalog = typed_headers.load_typed_catalog(conn) if exists else {}
+        _global_typed_cache = (exists, catalog)
 
 
 def _build_global_headers_map(session=None) -> dict[str, list[dict]]:
@@ -342,72 +366,61 @@ def _build_global_headers_map(session=None) -> dict[str, list[dict]]:
         return session.headers_map()
 
     global _global_headers_cache
-    if _global_headers_cache is not None:
-        return _global_headers_cache
+    if _global_headers_cache is None:
+        _load_global_index_unlocked()
+    return _global_headers_cache
 
-    result = _headers_map_from_entries(get_global_composer_headers())
-    _global_headers_cache = result
-    return result
+
+def typed_index_state(session=None) -> tuple[bool, dict]:
+    """Return ``(typed_table_exists, catalog)`` from the command epoch.
+
+    Without *session*, shares the one-connection process cache used by
+    ``_build_global_headers_map``.
+    """
+    if session is not None:
+        return session.typed_table_exists(), session.typed_catalog()
+
+    global _global_typed_cache
+    if _global_typed_cache is None:
+        _load_global_index_unlocked()
+    return _global_typed_cache
 
 
 def invalidate_headers_cache():
     """Clear the cached global headers map (call after writing to the global DB)."""
-    global _global_headers_cache
+    global _global_headers_cache, _global_typed_cache
     _global_headers_cache = None
+    _global_typed_cache = None
 
 
-def get_workspace_composer_ids(
+def _legacy_workspace_composer_ids(
     ws_db_path: Path,
-    session=None,
-    headers_map: Optional[dict[str, list[dict]]] = None,
-) -> list[str]:
-    """Extract all composer IDs associated with a workspace.
-
-    Combines multiple sources for maximum coverage:
-    1. Global composer.composerHeaders index (Cursor 3.0+, most authoritative
-       but only contains recently-active chats)
-    2. Workspace DB selectedComposerIds + composerChatViewPane entries
-       (catches chats opened before the 3.0 migration that aren't yet
-       in the global index)
-    3. Workspace DB allComposers (Cursor 2.x fallback)
-
-    Returns deduplicated IDs. Pass *session* or *headers_map* to reuse
-    the command's global read epoch instead of opening another copy.
-    """
+    ws_hash: str,
+    headers_map: dict[str, list[dict]],
+) -> set[str]:
+    """JSON headers + workspace selected/focused/pane/allComposers."""
     from . import db
 
     ids: set[str] = set()
-    ws_hash = ws_db_path.parent.name
-
-    # Source 1: global headers index (Cursor 3.0+)
-    if headers_map is None:
-        headers_map = _build_global_headers_map(session)
     for entry in headers_map.get(ws_hash, []):
         cid = entry.get("composerId")
         if cid:
             ids.add(cid)
-
-    # Source 2+3: workspace DB
     try:
         with db.CursorDB(ws_db_path) as cdb:
             data = cdb.get_json("composer.composerData", table="ItemTable")
             if not data:
-                return list(ids)
-
-            # Cursor 2.x: allComposers (complete list for old workspaces)
+                return ids
             for c in data.get("allComposers", []):
                 cid = c.get("composerId")
                 if cid:
                     ids.add(cid)
-
-            # Cursor 3.0+: supplementary sources for chats not in global index
             for cid in data.get("selectedComposerIds", []):
                 if cid:
                     ids.add(cid)
             for cid in data.get("lastFocusedComposerIds", []):
                 if cid:
                     ids.add(cid)
-
             for key in cdb.list_keys(
                 "workbench.panel.composerChatViewPane.", table="ItemTable"
             ):
@@ -420,8 +433,46 @@ def get_workspace_composer_ids(
                                 ids.add(cid)
     except Exception:
         pass
+    return ids
 
-    return list(ids)
+
+def get_workspace_composer_ids(
+    ws_db_path: Path,
+    session=None,
+    headers_map: Optional[dict[str, list[dict]]] = None,
+) -> list[str]:
+    """Extract all composer IDs associated with a workspace.
+
+    Two generations, not a naive union:
+
+    * CURRENT: physical ``composerHeaders`` table. A CID with a typed
+      row is bound exclusively to that row's ``workspaceId``.
+    * LEGACY: ``composer.composerHeaders`` JSON plus workspace
+      selected/focused/pane/allComposers, used only for CIDs that have
+      no typed row.
+
+    When the typed table is absent (older Cursor), behaviour matches
+    the previous JSON + workspace union.
+
+    Pass *session* or *headers_map* to reuse the command's global read
+    epoch instead of opening another copy.
+    """
+    ws_hash = ws_db_path.parent.name
+    if headers_map is None:
+        headers_map = _build_global_headers_map(session)
+    typed_exists, typed_catalog = typed_index_state(session)
+    legacy_ids = _legacy_workspace_composer_ids(ws_db_path, ws_hash, headers_map)
+    if not typed_exists:
+        return list(legacy_ids)
+
+    typed_ids = {
+        cid
+        for cid, row in typed_catalog.items()
+        if getattr(row, "workspace_id", None) == ws_hash
+        and not getattr(row, "is_subagent", 0)
+    }
+    typed_all = set(typed_catalog.keys())
+    return list(typed_ids | (legacy_ids - typed_all))
 
 
 def list_workspaces_with_conversations(session=None) -> list[dict]:

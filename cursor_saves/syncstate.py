@@ -32,7 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Collection, Iterator, Optional
 
-from . import db, dblock, export, importer, paths
+from . import db, dblock, export, importer, paths, typed_headers
 
 
 class SyncRelation(str, Enum):
@@ -919,6 +919,10 @@ class SyncReadSession:
         self._presence: dict[str, LocalPresence] = {}
         self._composer_headers: Optional[list[dict]] = None
         self._headers_map: Optional[dict[str, list[dict]]] = None
+        self._typed_loaded = False
+        self._typed_table_exists = False
+        self._typed_schema = typed_headers.TypedSchemaStatus.ABSENT
+        self._typed_catalog: dict[str, typed_headers.TypedHeaderRow] = {}
         self.cache = SemanticsCache()
 
     def __enter__(self) -> "SyncReadSession":
@@ -978,6 +982,39 @@ class SyncReadSession:
         if self._headers_map is None:
             self._headers_map = paths._headers_map_from_entries(self.composer_headers())
         return self._headers_map
+
+    def _ensure_typed_index(self) -> None:
+        """Load the typed catalog from this session's epoch connection."""
+        if self._typed_loaded:
+            return
+        self._typed_loaded = True
+        self._typed_table_exists = False
+        self._typed_schema = typed_headers.TypedSchemaStatus.ABSENT
+        self._typed_catalog = {}
+        if self._cdb is None:
+            return
+        conn = self._cdb._ensure_read_copy()
+        self._typed_schema = typed_headers.typed_schema_status(conn)
+        self._typed_table_exists = (
+            self._typed_schema == typed_headers.TypedSchemaStatus.USABLE
+        )
+        if self._typed_table_exists:
+            self._typed_catalog = typed_headers.load_typed_catalog(conn)
+
+    def typed_table_exists(self) -> bool:
+        self._ensure_typed_index()
+        return self._typed_table_exists
+
+    def typed_schema(self) -> typed_headers.TypedSchemaStatus:
+        self._ensure_typed_index()
+        return self._typed_schema
+
+    def typed_catalog(self) -> dict[str, typed_headers.TypedHeaderRow]:
+        self._ensure_typed_index()
+        return self._typed_catalog
+
+    def typed_row(self, composer_id: str) -> Optional[typed_headers.TypedHeaderRow]:
+        return self.typed_catalog().get(composer_id)
 
     def _ingest_composer_row(
         self, cid: str, composer_raw: bytes, bubbles: list[tuple[str, bytes]]
@@ -1334,12 +1371,14 @@ class PlannedItem:
     classified_content_digest: str = ""
     dest_expected_present: Optional[bool] = None
     local_guard: Optional["LocalGuard"] = None
+    registration: Optional[typed_headers.RegistrationHealth] = None
 
 
 @dataclass
 class SyncPlan:
     items: list[PlannedItem] = field(default_factory=list)
     target_workspace: Optional[dict] = None
+    typed_table_exists: bool = False
 
     def by_relation(self, relation: SyncRelation) -> list[PlannedItem]:
         return [i for i in self.items if i.relation == relation]
@@ -1363,6 +1402,61 @@ class SyncPlan:
     @property
     def unsafe(self) -> bool:
         return bool(self.diverged or self.unknown)
+
+    @property
+    def registration_conflicts(self) -> list[PlannedItem]:
+        """Typed row already bound to an incompatible workspace."""
+        return [
+            item
+            for item in self.items
+            if typed_headers.is_registration_conflict(item.registration)
+        ]
+
+
+def _registration_for_listed(
+    session: SyncReadSession,
+    composer_id: str,
+    workspace_id: str,
+    target_identifier: Optional[dict] = None,
+) -> typed_headers.RegistrationHealth:
+    """CID came from workspace membership. No typed row → legacy-only."""
+    if not session.typed_table_exists():
+        return typed_headers.RegistrationHealth.REGISTERED
+    row = session.typed_row(composer_id)
+    typed_ident = None
+    if row is not None:
+        typed_ident = row.header.get("workspaceIdentifier")
+    return typed_headers.classify_registration(
+        typed_table_exists=True,
+        typed_workspace_id=row.workspace_id if row is not None else None,
+        target_workspace_id=workspace_id,
+        in_legacy_sources=row is None,
+        typed_identifier=typed_ident,
+        target_identifier=target_identifier,
+    )
+
+
+def _registration_for_snapshot_only(
+    session: SyncReadSession,
+    composer_id: str,
+    workspace_id: str,
+    target_identifier: Optional[dict] = None,
+) -> typed_headers.RegistrationHealth:
+    """Snapshot-only CID: missing typed row is MISSING, not legacy-only."""
+    if not session.typed_table_exists():
+        return typed_headers.RegistrationHealth.REGISTERED
+    row = session.typed_row(composer_id)
+    typed_ident = None
+    if row is not None:
+        typed_ident = row.header.get("workspaceIdentifier")
+    return typed_headers.classify_registration(
+        typed_table_exists=True,
+        typed_workspace_id=row.workspace_id if row is not None else None,
+        target_workspace_id=workspace_id,
+        in_legacy_sources=False,
+        typed_identifier=typed_ident,
+        target_identifier=target_identifier,
+    )
 
 
 def _planned_name(
@@ -1493,6 +1587,7 @@ def build_sync_plan(
     classified (the historical global ``sync``).
     """
     plan = SyncPlan(target_workspace=target_workspace)
+    plan.typed_table_exists = session.typed_table_exists()
     seen: set[tuple[str, str]] = set()
     session.cache = index.cache
 
@@ -1527,6 +1622,7 @@ def build_sync_plan(
             continue
         project_id = paths.get_workspace_project_identifier(ws)
         lookup_id = snapshot_project_id or project_id
+        target_identifier = importer._build_workspace_identifier(ws_dir)
         composer_ids = paths.get_workspace_composer_ids(db_path, session=session)
         for cid in composer_ids:
             key = (lookup_id, cid)
@@ -1569,6 +1665,9 @@ def build_sync_plan(
                     project_path=ws.get("path") or "",
                     source_host=ws.get("host"),
                     project_identifier=lookup_id,
+                    registration=_registration_for_listed(
+                        session, cid, ws_dir.name, target_identifier
+                    ),
                 )
                 if relation == SyncRelation.BEHIND:
                     present = session.raw_fingerprint(cid) is not None
@@ -1604,6 +1703,44 @@ def build_sync_plan(
             if target_workspace is not None and rec.composer_id not in (
                 target_ids or set()
             ) and _global_has_composer(session, rec.composer_id):
+                # Typed-wins hides this CID from the target listing. A
+                # foreign/stale typed row is still this target's conflict:
+                # do not skip it as "already in sync".
+                remote_ws_dir = target_workspace.get("workspace_dir")
+                health = _registration_for_snapshot_only(
+                    session,
+                    rec.composer_id,
+                    Path(remote_ws_dir).name if remote_ws_dir is not None else "",
+                    importer._build_workspace_identifier(remote_ws_dir)
+                    if remote_ws_dir is not None
+                    else None,
+                )
+                if typed_headers.is_registration_conflict(health):
+                    seen.add(key)
+                    try:
+                        relation = classify_conversation(
+                            session,
+                            index,
+                            rec.composer_id,
+                            workspace=target_workspace,
+                            project_identifier=snapshot_project_id,
+                        )
+                    except ClassifyError:
+                        relation = SyncRelation.UNKNOWN
+                    plan.items.append(
+                        PlannedItem(
+                            composer_id=rec.composer_id,
+                            relation=relation,
+                            name=rec.meta.get("name") or "Untitled",
+                            snapshot_path=rec.path,
+                            meta=rec.meta,
+                            workspace_dir=remote_ws_dir,
+                            project_path=target_workspace.get("path") or "",
+                            source_host=target_workspace.get("host"),
+                            project_identifier=rec.project_identifier,
+                            registration=health,
+                        )
+                    )
                 continue
             seen.add(key)
             # No local workspace registered this CID for this origin. Do not
@@ -1635,6 +1772,14 @@ def build_sync_plan(
                 project_path=remote_path,
                 source_host=remote_host,
                 project_identifier=rec.project_identifier,
+                registration=_registration_for_snapshot_only(
+                    session,
+                    rec.composer_id,
+                    Path(remote_ws_dir).name if remote_ws_dir is not None else "",
+                    importer._build_workspace_identifier(remote_ws_dir)
+                    if remote_ws_dir is not None
+                    else None,
+                ),
             )
             if relation == SyncRelation.BEHIND:
                 present = session.raw_fingerprint(rec.composer_id) is not None
@@ -1709,6 +1854,7 @@ class PullItem:
     classified_identity: tuple = ()
     classified_content_digest: str = ""
     local_guard: Optional[LocalGuard] = None
+    registration: Optional[typed_headers.RegistrationHealth] = None
 
 
 @dataclass
@@ -1716,6 +1862,7 @@ class PullPlan:
     items: list[PullItem] = field(default_factory=list)
     never_pushed: int = 0
     restore_all: bool = False
+    typed_table_exists: bool = False
 
     def by_relation(self, relation: PullRelation) -> list[PullItem]:
         return [i for i in self.items if i.relation == relation]
@@ -1751,6 +1898,15 @@ class PullPlan:
     @property
     def collisions(self) -> list[PullItem]:
         return self.by_relation(PullRelation.GLOBAL_COLLISION)
+
+    @property
+    def registration_conflicts(self) -> list[PullItem]:
+        """Typed row already bound to an incompatible workspace."""
+        return [
+            item
+            for item in self.items
+            if typed_headers.is_registration_conflict(item.registration)
+        ]
 
 
 def _pull_action(relation: PullRelation, restore_all: bool) -> PullAction:
@@ -2024,10 +2180,15 @@ def _live_target_has_composer(
                 return True
     if workspace_dir is None:
         return False
+    ws_hash = Path(workspace_dir).name
+    live_conn = global_cdb._reader_conn()
+    if typed_headers.typed_table_usable(live_conn):
+        typed_row = typed_headers.get_typed_row(live_conn, composer_id)
+        if typed_row is not None:
+            return typed_row.workspace_id == ws_hash
     headers = _live_select_json(global_cdb, "composer.composerHeaders", "ItemTable")
     if not isinstance(headers, dict):
         return False
-    ws_hash = Path(workspace_dir).name
     for entry in headers.get("allComposers") or []:
         if not isinstance(entry, dict) or entry.get("composerId") != composer_id:
             continue
@@ -2086,6 +2247,7 @@ def build_pull_plan(
     importing it would overwrite the other workspace's conversation.
     """
     plan = PullPlan(restore_all=restore_all)
+    plan.typed_table_exists = session.typed_table_exists()
     session.cache = index.cache
     selected = {p.resolve() for p in selected_paths} if selected_paths else None
     target_ids = _target_workspace_composer_ids(target_workspace, session=session)
@@ -2150,6 +2312,20 @@ def build_pull_plan(
                     relation = PullRelation.UNKNOWN
                     action = PullAction.SKIP
 
+            ws_hash = Path(ws_dir).name if ws_dir is not None else ""
+            target_identifier = (
+                importer._build_workspace_identifier(ws_dir)
+                if ws_dir is not None
+                else None
+            )
+            if rec.composer_id in target_ids and ws_hash:
+                registration = _registration_for_listed(
+                    session, rec.composer_id, ws_hash, target_identifier
+                )
+            else:
+                registration = _registration_for_snapshot_only(
+                    session, rec.composer_id, ws_hash, target_identifier
+                )
             item = PullItem(
                 composer_id=rec.composer_id,
                 relation=relation,
@@ -2164,16 +2340,40 @@ def build_pull_plan(
                 classified_identity=rec.identity,
                 classified_content_digest=content_digest,
                 local_guard=local_guard,
+                registration=registration,
             )
             plan.items.append(item)
         finally:
             session.release_composer_cell(rec.composer_id)
 
     never_pushed = 0
+    ws_hash = Path(ws_dir).name if ws_dir is not None else ""
     for cid in target_ids - snapshot_cids:
         try:
             if classify_local_conversation(session, cid) == LocalPresence.ACTIVE:
                 never_pushed += 1
+                data = session.composer_data(cid) or {}
+                plan.items.append(
+                    PullItem(
+                        composer_id=cid,
+                        relation=PullRelation.NEVER_PUSHED,
+                        action=PullAction.SKIP,
+                        name=data.get("name") or "Untitled",
+                        workspace_dir=ws_dir,
+                        project_path=project_path,
+                        source_host=source_host,
+                        registration=_registration_for_listed(
+                            session,
+                            cid,
+                            ws_hash,
+                            importer._build_workspace_identifier(ws_dir)
+                            if ws_dir is not None
+                            else None,
+                        )
+                        if ws_hash
+                        else None,
+                    )
+                )
         finally:
             session.release_composer_cell(cid)
     plan.never_pushed = never_pushed
@@ -2244,7 +2444,7 @@ def stage_import_candidates(plan: PullPlan, staging_dir: Path) -> list[PullItem]
 
 def stage_behind_snapshots(plan: SyncPlan, staging_dir: Path) -> bool:
     """Pin every BEHIND snapshot. False if any classified file changed."""
-    if plan.unsafe:
+    if plan.unsafe or plan.registration_conflicts:
         return False
     for item in plan.behind:
         if not _stage_snapshot_item(item, staging_dir):
@@ -2353,7 +2553,7 @@ def stage_ahead_exports(
     Must be called before the read epoch is closed. Does nothing when the
     plan is unsafe or has no ahead items — no lease is created.
     """
-    if plan.unsafe:
+    if plan.unsafe or plan.registration_conflicts:
         return None
     verify_ahead_destinations(plan)
     if not plan.ahead:

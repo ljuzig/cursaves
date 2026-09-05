@@ -455,7 +455,7 @@ def test_sync_releases_sqlite_before_repo(sqlite_lock, tmp_path, monkeypatch):
 
     monkeypatch.setattr(dblock, "repo_lock", guarded_repo_lock)
 
-    def fake_pull_behind(sync_dir, plan=None):
+    def fake_pull_behind(sync_dir, plan=None, backup=None):
         with db.CursorDB(db_path) as cdb:
             cdb.write_item("hello", "behind")
             assert db.write_connections_open()

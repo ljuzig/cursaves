@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from cursor_saves import backends, db, dblock, paths, syncstate
+from cursor_saves import backends, db, dblock, paths, pull, syncstate
 
 # Captured before any fixture rewrites HOME. Optional passwd home covers
 # nix-shell, where $HOME is already a temp directory.
@@ -131,3 +131,12 @@ def isolate_from_real_user_data(tmp_path_factory, monkeypatch):
     db.reset_write_tracking_for_tests()
     dblock.reset_for_tests()
     syncstate.reset_op_counts()
+
+
+@pytest.fixture(autouse=True)
+def cursor_not_running_for_write_gates(request, monkeypatch):
+    """Write gates must not depend on whether the developer has Cursor open."""
+    if getattr(request, "module", None) is not None:
+        if request.module.__name__ == "tests.test_cursor_running":
+            return
+    monkeypatch.setattr(pull, "is_cursor_running", lambda: False)

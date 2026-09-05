@@ -23,11 +23,12 @@ def get_workspace_conversations(
     If workspace_dir is provided, only reads from that specific workspace
     (avoids cross-host contamination for SSH workspaces with the same path).
 
-    Combines global headers index (Cursor 3.0+), workspace DB allComposers
-    (Cursor 2.x), and per-workspace pane/selection entries to build a
-    complete list. Metadata for IDs only found via pane entries is fetched
-    from the global DB's composerData. Pass *session* to reuse the
-    command's global read epoch.
+    Combines the typed ``composerHeaders`` table (current), the legacy
+    JSON ``composer.composerHeaders`` index, workspace DB allComposers
+    (Cursor 2.x), and per-workspace pane/selection entries. A CID with
+    a typed row is bound only to that row's workspace. Metadata for IDs
+    only found via pane entries is fetched from composerData. Pass
+    *session* to reuse the command's global read epoch.
     """
     if workspace_dir is not None:
         ws_dirs = [workspace_dir]
@@ -40,15 +41,29 @@ def get_workspace_conversations(
     seen_ids: set[str] = set()
     ids_needing_metadata: list[tuple[str, str]] = []  # (composerId, ws_dir_str)
     headers_map = paths._build_global_headers_map(session)
+    typed_exists, typed_catalog = paths.typed_index_state(session)
+    typed_all = set(typed_catalog.keys()) if typed_exists else set()
 
     for ws_dir in ws_dirs:
         ws_hash = ws_dir.name
         ws_dir_str = str(ws_dir)
 
-        # Source 1: global headers (has full metadata inline)
+        if typed_exists:
+            for cid, row in typed_catalog.items():
+                if row.workspace_id != ws_hash or cid in seen_ids:
+                    continue
+                if getattr(row, "is_subagent", 0):
+                    continue
+                seen_ids.add(cid)
+                entry = dict(row.header)
+                entry.setdefault("composerId", cid)
+                entry["_workspaceDir"] = ws_dir_str
+                all_conversations.append(entry)
+
+        # Legacy JSON headers: only CIDs without a typed row
         for entry in headers_map.get(ws_hash, []):
             cid = entry.get("composerId")
-            if cid and cid not in seen_ids:
+            if cid and cid not in seen_ids and cid not in typed_all:
                 seen_ids.add(cid)
                 entry_copy = dict(entry)
                 entry_copy["_workspaceDir"] = ws_dir_str
@@ -67,7 +82,7 @@ def get_workspace_conversations(
             # allComposers (Cursor 2.x — has full metadata)
             for c in data.get("allComposers", []):
                 cid = c.get("composerId")
-                if cid and cid not in seen_ids:
+                if cid and cid not in seen_ids and cid not in typed_all:
                     seen_ids.add(cid)
                     c["_workspaceDir"] = ws_dir_str
                     all_conversations.append(c)
@@ -75,10 +90,10 @@ def get_workspace_conversations(
             # selectedComposerIds + pane entries (need metadata lookup)
             extra_ids: set[str] = set()
             for cid in data.get("selectedComposerIds", []):
-                if cid and cid not in seen_ids:
+                if cid and cid not in seen_ids and cid not in typed_all:
                     extra_ids.add(cid)
             for cid in data.get("lastFocusedComposerIds", []):
-                if cid and cid not in seen_ids:
+                if cid and cid not in seen_ids and cid not in typed_all:
                     extra_ids.add(cid)
             for key in cdb.list_keys(
                 "workbench.panel.composerChatViewPane.", table="ItemTable"
@@ -88,7 +103,7 @@ def get_workspace_conversations(
                     for view_key in pane:
                         if ".view." in view_key:
                             cid = view_key.rsplit(".", 1)[-1]
-                            if cid and cid not in seen_ids:
+                            if cid and cid not in seen_ids and cid not in typed_all:
                                 extra_ids.add(cid)
 
             for cid in extra_ids:
