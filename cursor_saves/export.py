@@ -273,14 +273,13 @@ def list_conversations(
             if sess.local_presence(composer_id) != syncstate.LocalPresence.ACTIVE:
                 continue
             conv_data = sess.composer_data(composer_id) or {}
-            headers = conv_data.get("fullConversationHeadersOnly") or []
             results.append({
                 "id": composer_id,
                 "name": c.get("name", "Untitled"),
                 "date": format_timestamp(c.get("createdAt", 0)),
                 "lastUpdated": format_timestamp(c.get("lastUpdatedAt", c.get("createdAt", 0))),
                 "mode": c.get("unifiedMode", c.get("forceMode", "unknown")),
-                "messageCount": len(headers) if isinstance(headers, list) else 0,
+                "messageCount": syncstate.semantic_message_count(conv_data),
             })
         return results
 
@@ -625,6 +624,8 @@ def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
         snapshot_file.write_bytes(compressed)
 
     # Write lightweight metadata sidecar (avoids decompressing for listings)
+    from . import syncstate
+
     cd = snapshot.get("composerData", {})
     num_shards = 0
     if len(compressed) > SHARD_SIZE_BYTES:
@@ -632,7 +633,7 @@ def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
     meta = {
         "composerId": composer_id,
         "name": cd.get("name"),
-        "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+        "messageCount": syncstate.semantic_message_count(cd),
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),
@@ -642,7 +643,6 @@ def _save_snapshot_unlocked(snapshot: dict, snapshots_dir: Path) -> Path:
         "shardCount": num_shards if num_shards else None,
     }
     try:
-        from . import syncstate
         meta["semanticDigest"] = syncstate.snapshot_semantic_digest(snapshot)
         meta["semanticDigestVersion"] = syncstate.SEMANTIC_DIGEST_VERSION
         meta["snapshotContentDigest"] = syncstate.snapshot_content_digest(

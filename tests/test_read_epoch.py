@@ -99,7 +99,7 @@ def _count_snapshots(monkeypatch):
 
 
 def test_digest_and_cache_versions_unchanged():
-    assert syncstate.SEMANTIC_DIGEST_VERSION == 3
+    assert syncstate.SEMANTIC_DIGEST_VERSION == 4
     assert syncstate._CACHE_VERSION == 5
 
 

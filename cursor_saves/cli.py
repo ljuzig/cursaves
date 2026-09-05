@@ -469,9 +469,8 @@ def cmd_export(args):
 
     # Show summary
     data = snapshot["composerData"]
-    headers = data.get("fullConversationHeadersOnly", [])
     blobs = snapshot.get("contentBlobs", {})
-    print(f"  Messages: {len(headers)}")
+    print(f"  Messages: {syncstate.semantic_message_count(data)}")
     print(f"  Content blobs: {len(blobs)}")
     print(f"  Source: {snapshot['sourceMachine']}")
 
