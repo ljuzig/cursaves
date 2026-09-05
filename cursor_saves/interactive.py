@@ -118,7 +118,7 @@ def select_workspace(workspaces: list[dict]) -> dict | None:
         convos = ws.get("conversations", 0)
         label = f"{name} ({host})" if host else name
         choices.append({
-            "name": f"{label:<40} {convos:>3} chats",
+            "name": f"{label:<40} {convos:>3} refs",
             "_ws": ws,
         })
 
