@@ -98,13 +98,13 @@ def test_real_workspace_grouping_only_on_snapshot_is_up_to_date():
     assert _relation(local, remote) == syncstate.SyncRelation.UP_TO_DATE
 
 
-def test_v2_sidecar_digest_never_trusted_under_v3(sync_env):
+def test_v2_sidecar_digest_never_trusted_under_current(sync_env):
     snap = _conversation([_msg(1, "A")], composer_id=CID_A)
     _commit_env(sync_env, [snap], [snap], digest=True, gzip_cids={CID_A})
     meta_path = sync_env["project_dir"] / f"{CID_A}.meta.json"
     meta = json.loads(meta_path.read_text())
     meta["semanticDigestVersion"] = 2
-    meta["semanticDigest"] = "sha256:not-a-real-v3-digest"
+    meta["semanticDigest"] = "sha256:not-a-real-current-digest"
     meta_path.write_text(json.dumps(meta))
 
     syncstate.reset_op_counts()
@@ -121,7 +121,7 @@ def test_v2_sidecar_digest_never_trusted_under_v3(sync_env):
 
     cache_path = sync_env["tmp"] / "cache" / "sync-semantics.json"
     payload = json.loads(cache_path.read_text())
-    assert payload["version"] == 5
+    assert payload["version"] == syncstate._CACHE_VERSION
     for rec in payload["snapshots"].values():
-        assert rec["semanticDigestVersion"] == 3
-        assert rec["semanticDigest"] != "sha256:not-a-real-v3-digest"
+        assert rec["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
+        assert rec["semanticDigest"] != "sha256:not-a-real-current-digest"

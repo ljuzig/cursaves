@@ -13,10 +13,11 @@ The cache is never authoritative when missing or stale. Snapshot files
 are never rewritten.
 
 A header with no bubble body is a first-class tombstone, not an error.
-``SEMANTIC_DIGEST_VERSION`` 3 hashes an explicit missing/present bubble
-state and omits derived ``header.grouping``. Older sidecar digests are
-never trusted; the snapshot is deep-read and the regenerable cache
-stores the current version.
+``SEMANTIC_DIGEST_VERSION`` 4 keeps that bubble-state model and adds
+legacy monolithic ``composerData.conversation`` units, namespaced so
+they cannot collide with modern header/bubble hashes. Older sidecar
+digests are never trusted; the snapshot is deep-read and the
+regenerable cache stores the current version.
 """
 
 from __future__ import annotations
@@ -76,7 +77,8 @@ _EXPLICIT_BLOB_KEYS = frozenset({"contentHash", "blobId", "contentHashes"})
 
 _CACHE_VERSION = 5
 LOCAL_PAYLOAD_VERSION = 1
-SEMANTIC_DIGEST_VERSION = 3
+SEMANTIC_DIGEST_VERSION = 4
+_LEGACY_CONVERSATION_SCHEMA = "legacy-conversation"
 _HASH_CHUNK = 1024 * 1024
 
 
@@ -322,17 +324,38 @@ def classify_local_payload(data: Any) -> LocalPresence:
 
     ``None`` is JSON null, not an absent row: that is INVALID. Callers
     that see a missing SQL row must return DANGLING themselves.
+
+    Two message lists are recognized: modern
+    ``fullConversationHeadersOnly`` and, only when that key is absent,
+    legacy monolithic ``conversation``. Ambiguous or malformed payloads
+    stay INVALID.
     """
     if data is None or not isinstance(data, dict):
         return LocalPresence.INVALID
-    if "fullConversationHeadersOnly" not in data:
-        return LocalPresence.INVALID
-    headers = data["fullConversationHeadersOnly"]
-    if not isinstance(headers, list):
-        return LocalPresence.INVALID
-    if len(headers) == 0:
-        return LocalPresence.EMPTY
-    return LocalPresence.ACTIVE
+    if "fullConversationHeadersOnly" in data:
+        headers = data["fullConversationHeadersOnly"]
+        if not isinstance(headers, list):
+            return LocalPresence.INVALID
+        return LocalPresence.EMPTY if not headers else LocalPresence.ACTIVE
+    if "conversation" in data:
+        conversation = data["conversation"]
+        if not isinstance(conversation, list):
+            return LocalPresence.INVALID
+        return LocalPresence.EMPTY if not conversation else LocalPresence.ACTIVE
+    return LocalPresence.INVALID
+
+
+def semantic_message_count(data: Any) -> int:
+    """Display count using the same schema precedence as classification."""
+    if not isinstance(data, dict):
+        return 0
+    if "fullConversationHeadersOnly" in data:
+        headers = data["fullConversationHeadersOnly"]
+        return len(headers) if isinstance(headers, list) else 0
+    if "conversation" in data:
+        conversation = data["conversation"]
+        return len(conversation) if isinstance(conversation, list) else 0
+    return 0
 
 
 def classify_local_conversation(
@@ -340,8 +363,9 @@ def classify_local_conversation(
 ) -> LocalPresence:
     """Workspace CID → ACTIVE / EMPTY / DANGLING / INVALID.
 
-    Headers present with missing bubble bodies stay ACTIVE. Only a true
-    empty header list is EMPTY. Read/JSON errors and JSON null are INVALID.
+    Headers or legacy ``conversation`` items present with missing bubble
+    bodies stay ACTIVE. Only a true empty recognized list is EMPTY.
+    Read/JSON errors and JSON null are INVALID.
     """
     return session.local_presence(composer_id)
 
@@ -370,6 +394,48 @@ def _headers(composer_data: Optional[dict]) -> list[dict]:
         return []
     headers = composer_data.get("fullConversationHeadersOnly") or []
     return [h for h in headers if isinstance(h, dict)]
+
+
+def _legacy_messages(conversation: Any) -> list[dict]:
+    """Ordered legacy ``conversation`` items. Fail closed on bad entries."""
+    if not isinstance(conversation, list):
+        raise ClassifyError("legacy conversation is not a list")
+    messages: list[dict] = []
+    for index, item in enumerate(conversation):
+        if not isinstance(item, dict):
+            raise ClassifyError(
+                f"legacy conversation[{index}] is not an object"
+            )
+        if not item.get("bubbleId"):
+            raise ClassifyError(
+                f"legacy conversation[{index}] is missing bubbleId"
+            )
+        messages.append(item)
+    return messages
+
+
+def _legacy_unit_hash(message: dict, blobs: dict[str, Any]) -> str:
+    """One namespaced unit hash for a legacy monolithic message."""
+    normalized = _normalize_unit_object(message, top=True)
+    refs = _required_blob_ids(normalized, set(blobs))
+    for ref in refs:
+        if ref not in blobs:
+            raise ClassifyError(f"referenced blob missing: {ref}")
+    payload: dict[str, Any] = {
+        "schema": _LEGACY_CONVERSATION_SCHEMA,
+        "message": normalized,
+    }
+    hashed_refs = _referenced_blob_ids(normalized, set(blobs))
+    if hashed_refs:
+        payload["blobs"] = {
+            ref: _sha256_bytes(_blob_bytes(blobs[ref]))
+            for ref in sorted(hashed_refs)
+        }
+    return _sha256_text(_canonical_json(payload))
+
+
+def _legacy_unit_hashes(conversation: Any, blobs: dict[str, Any]) -> list[str]:
+    return [_legacy_unit_hash(message, blobs) for message in _legacy_messages(conversation)]
 
 
 def _optional_mapping(value: Any, name: str) -> Optional[dict]:
@@ -423,21 +489,28 @@ def snapshot_unit_hashes(snapshot: dict) -> list[str]:
     blobs = snapshot.get("contentBlobs") or {}
     if not isinstance(blobs, dict):
         blobs = {}
-    headers = _headers(composer)
-    hashes: list[str] = []
-    for header in headers:
-        bid = header.get("bubbleId")
-        if not bid:
-            raise ClassifyError("header is missing bubbleId")
-        bubble = _bubble_from_snapshot(snapshot, bid)
-        sem_header = _semantic_header(header)
-        ref_payload: Any = sem_header if bubble is None else (sem_header, bubble)
-        refs = _required_blob_ids(ref_payload, set(blobs))
-        for ref in refs:
-            if ref not in blobs:
-                raise ClassifyError(f"referenced blob missing: {ref}")
-        hashes.append(unit_hash(header, bubble, blobs))
-    return hashes
+    if "fullConversationHeadersOnly" in composer:
+        raw_headers = composer["fullConversationHeadersOnly"]
+        if not isinstance(raw_headers, list):
+            raise ClassifyError("fullConversationHeadersOnly is not a list")
+        headers = [h for h in raw_headers if isinstance(h, dict)]
+        hashes: list[str] = []
+        for header in headers:
+            bid = header.get("bubbleId")
+            if not bid:
+                raise ClassifyError("header is missing bubbleId")
+            bubble = _bubble_from_snapshot(snapshot, bid)
+            sem_header = _semantic_header(header)
+            ref_payload: Any = sem_header if bubble is None else (sem_header, bubble)
+            refs = _required_blob_ids(ref_payload, set(blobs))
+            for ref in refs:
+                if ref not in blobs:
+                    raise ClassifyError(f"referenced blob missing: {ref}")
+            hashes.append(unit_hash(header, bubble, blobs))
+        return hashes
+    if "conversation" in composer:
+        return _legacy_unit_hashes(composer.get("conversation"), blobs)
+    raise ClassifyError("composerData has no recognized message list")
 
 
 def snapshot_semantic_digest(snapshot: dict) -> str:
@@ -1129,24 +1202,38 @@ class SyncReadSession:
             return None
         return self._local_digest.get(composer_id)
 
-    def local_unit_hashes(self, composer_id: str) -> Optional[list[str]]:
-        if composer_id in self._local_hashes:
-            return self._local_hashes[composer_id]
-        present, data = self.composer_cell(composer_id)
-        if not present:
-            return None
-        if classify_local_payload(data) == LocalPresence.INVALID:
-            raise ClassifyError("local composerData is unreadable")
-        _counts.local_semantic_rehashes += 1
-        headers = _headers(data)
+    def _load_local_blobs(
+        self,
+        payload: Any,
+        available: set[str],
+        discovered: set[str],
+    ) -> dict[str, Any]:
+        blobs: dict[str, Any] = {}
+        for ref in _required_blob_ids(payload, available):
+            val = self._cdb.get_disk_kv(f"composer.content.{ref}") if self._cdb else None
+            if val is None:
+                raise ClassifyError(f"referenced blob missing locally: {ref}")
+            blobs[ref] = val
+            discovered.add(ref)
+        return blobs
+
+    def _modern_local_unit_hashes(
+        self,
+        composer_id: str,
+        data: dict,
+        available: set[str],
+        discovered: set[str],
+    ) -> list[str]:
         hashes: list[str] = []
-        available = self._available_blob_ids()
-        discovered: set[str] = set()
-        for header in headers:
+        for header in _headers(data):
             bid = header.get("bubbleId")
             if not bid:
                 raise ClassifyError("local header is missing bubbleId")
-            bubble = _strict_select_json(self._cdb, f"bubbleId:{composer_id}:{bid}")
+            bubble = (
+                _strict_select_json(self._cdb, f"bubbleId:{composer_id}:{bid}")
+                if self._cdb is not None
+                else None
+            )
             if bubble is None:
                 cmap = _optional_mapping(
                     data.get("conversationMap"),
@@ -1158,14 +1245,40 @@ class SyncReadSession:
                 raise ClassifyError(f"local bubble {bid} is not an object")
             sem_header = _semantic_header(header)
             blob_payload: Any = sem_header if bubble is None else (sem_header, bubble)
-            blobs: dict[str, Any] = {}
-            for ref in _required_blob_ids(blob_payload, available):
-                val = self._cdb.get_disk_kv(f"composer.content.{ref}")
-                if val is None:
-                    raise ClassifyError(f"referenced blob missing locally: {ref}")
-                blobs[ref] = val
-                discovered.add(ref)
+            blobs = self._load_local_blobs(blob_payload, available, discovered)
             hashes.append(unit_hash(header, bubble, blobs))
+        return hashes
+
+    def _legacy_local_unit_hashes(
+        self,
+        data: dict,
+        available: set[str],
+        discovered: set[str],
+    ) -> list[str]:
+        hashes: list[str] = []
+        for message in _legacy_messages(data.get("conversation")):
+            normalized = _normalize_unit_object(message, top=True)
+            blobs = self._load_local_blobs(normalized, available, discovered)
+            hashes.append(_legacy_unit_hash(message, blobs))
+        return hashes
+
+    def local_unit_hashes(self, composer_id: str) -> Optional[list[str]]:
+        if composer_id in self._local_hashes:
+            return self._local_hashes[composer_id]
+        present, data = self.composer_cell(composer_id)
+        if not present:
+            return None
+        if classify_local_payload(data) == LocalPresence.INVALID:
+            raise ClassifyError("local composerData is unreadable")
+        _counts.local_semantic_rehashes += 1
+        available = self._available_blob_ids()
+        discovered: set[str] = set()
+        if "fullConversationHeadersOnly" in data:
+            hashes = self._modern_local_unit_hashes(
+                composer_id, data, available, discovered
+            )
+        else:
+            hashes = self._legacy_local_unit_hashes(data, available, discovered)
         self._local_hashes[composer_id] = hashes
         digest = conversation_digest(hashes)
         self._local_digest[composer_id] = digest
