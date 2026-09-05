@@ -1151,7 +1151,7 @@ def test_blob_ref_json_key_order_is_up_to_date():
     assert _relation(local, remote) == syncstate.SyncRelation.UP_TO_DATE
 
 
-def test_sync_without_snapshots_skips_db_and_does_not_push_never_pushed(sync_env, monkeypatch):
+def test_sync_without_snapshots_does_not_push_never_pushed(sync_env, monkeypatch):
     never = _conversation([_msg(1, "new")], composer_id=CID_E, name="Never")
     _commit_env(sync_env, [never], [], digest=False)
     saves = {"n": 0}
@@ -1169,8 +1169,9 @@ def test_sync_without_snapshots_skips_db_and_does_not_push_never_pushed(sync_env
     syncstate.reset_op_counts()
     cli.cmd_sync(type("Args", (), {"force": False})())
     assert saves["n"] == 0
-    assert syncstate.op_counts().sqlite_backups == 0
     assert syncstate.op_counts().full_local_exports == 0
+    assert syncstate.op_counts().cursor_write_connections == 0
+    assert syncstate.op_counts().safety_global_backups == 0
 
 
 def test_sharded_snapshot_shard_change_invalidates_cache(sync_env):
