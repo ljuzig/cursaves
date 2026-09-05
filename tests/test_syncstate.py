@@ -971,6 +971,7 @@ def test_nine_hundred_warm_cache_skips_deep_work(sync_env):
     assert syncstate.op_counts().legacy_snapshot_decompressions == n
     assert syncstate.op_counts().local_semantic_rehashes == n
     assert syncstate.op_counts().local_inventory_json_parses == 0
+    assert syncstate.op_counts().local_composer_json_parses == n
 
     syncstate.reset_op_counts()
     with syncstate.SyncReadSession() as session:
@@ -980,6 +981,7 @@ def test_nine_hundred_warm_cache_skips_deep_work(sync_env):
     assert syncstate.op_counts().legacy_snapshot_decompressions == 0
     assert syncstate.op_counts().local_semantic_rehashes == 0
     assert syncstate.op_counts().local_inventory_json_parses == 0
+    assert syncstate.op_counts().local_composer_json_parses == 0
     assert syncstate.op_counts().sqlite_backups == 1
     assert syncstate.op_counts().snapshot_directory_scans == 1
     assert syncstate.op_counts().full_local_exports == 0
@@ -1090,10 +1092,12 @@ def test_persistent_cache_stores_digest_not_unit_hashes(sync_env):
         assert rec["semanticDigest"].startswith("sha256:")
         assert rec["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
         assert rec["sourceIdentity"]
+        assert "localPayloadVersion" not in rec
     assert payload["local"]
     for rec in payload["local"].values():
         assert "unitHashes" not in rec
         assert rec["semanticDigestVersion"] == syncstate.SEMANTIC_DIGEST_VERSION
+        assert rec["localPayloadVersion"] == syncstate.LOCAL_PAYLOAD_VERSION
         assert rec["rowFingerprint"].startswith("sha256:")
         assert "blobRefs" in rec
         assert rec["blobFingerprint"].startswith("sha256:")
@@ -1216,7 +1220,7 @@ def test_directory_is_authoritative_over_meta_project_identifier(sync_env):
             syncstate.classify_conversation(
                 session, index, CID_A, project_identifier="project-B"
             )
-            == syncstate.SyncRelation.NEVER_PUSHED
+            == syncstate.SyncRelation.UNKNOWN
         )
         assert (
             syncstate.classify_conversation(
