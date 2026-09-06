@@ -127,6 +127,7 @@ class OpCounts:
     snapshot_content_hashes: int = 0
     local_guard_checks: int = 0
     local_guard_skips: int = 0
+    compatibility_lineage_checks: int = 0
 
 
 _counts = OpCounts()
@@ -1345,14 +1346,13 @@ class SyncReadSession:
             discovered.add(ref)
         return blobs
 
-    def _modern_local_unit_hashes(
+    def _iter_local_modern_units(
         self,
         composer_id: str,
         data: dict,
         available: set[str],
         discovered: set[str],
-    ) -> list[str]:
-        hashes: list[str] = []
+    ) -> Iterator[tuple[dict, Optional[dict], dict[str, Any]]]:
         for header in _headers(data):
             bid = header.get("bubbleId")
             if not bid:
@@ -1374,8 +1374,21 @@ class SyncReadSession:
             sem_header = _semantic_header(header)
             blob_payload: Any = sem_header if bubble is None else (sem_header, bubble)
             blobs = self._load_local_blobs(blob_payload, available, discovered)
-            hashes.append(unit_hash(header, bubble, blobs))
-        return hashes
+            yield header, bubble, blobs
+
+    def _modern_local_unit_hashes(
+        self,
+        composer_id: str,
+        data: dict,
+        available: set[str],
+        discovered: set[str],
+    ) -> list[str]:
+        return [
+            unit_hash(header, bubble, blobs)
+            for header, bubble, blobs in self._iter_local_modern_units(
+                composer_id, data, available, discovered
+            )
+        ]
 
     def _legacy_local_unit_hashes(
         self,
@@ -1488,11 +1501,23 @@ class SyncPlan:
 
     @property
     def ahead(self) -> list[PlannedItem]:
-        return self.by_relation(SyncRelation.LOCAL_AHEAD)
+        """LOCAL_AHEAD and never-pushed chats that sync should export."""
+        return [
+            item
+            for item in self.items
+            if item.relation
+            in (SyncRelation.LOCAL_AHEAD, SyncRelation.NEVER_PUSHED)
+        ]
+
+    @property
+    def forks(self) -> list[PlannedItem]:
+        """Same-CID histories that are not safe to merge. Preserve both."""
+        return self.diverged
 
     @property
     def unsafe(self) -> bool:
-        return bool(self.diverged or self.unknown)
+        """True only for unreadable/malformed conversations. Forks are safe."""
+        return bool(self.unknown)
 
     @property
     def registration_conflicts(self) -> list[PlannedItem]:
@@ -1636,6 +1661,17 @@ def classify_conversation(
     except ClassifyError:
         return SyncRelation.UNKNOWN
     relation = classify_pair(local_hashes, remote_units, has_snapshot=True)
+    if relation == SyncRelation.DIVERGED:
+        from . import lineage
+
+        try:
+            compat = lineage.classify_after_canonical_diverged(session, rec)
+            if compat is not None:
+                relation = compat
+        except ClassifyError:
+            relation = SyncRelation.UNKNOWN
+        except Exception:
+            relation = SyncRelation.UNKNOWN
     index._remote_units.pop((rec.project_identifier, rec.composer_id), None)
     return relation
 
@@ -1783,6 +1819,15 @@ def build_sync_plan(
                         session,
                         rec,
                         expect_present=present,
+                        expect_in_target=True,
+                    ):
+                        item.relation = SyncRelation.UNKNOWN
+                elif relation == SyncRelation.DIVERGED:
+                    if rec is None or not _pin_behind_item(
+                        item,
+                        session,
+                        rec,
+                        expect_present=True,
                         expect_in_target=True,
                     ):
                         item.relation = SyncRelation.UNKNOWN
@@ -2610,10 +2655,10 @@ def stage_import_candidates(plan: PullPlan, staging_dir: Path) -> list[PullItem]
 
 
 def stage_behind_snapshots(plan: SyncPlan, staging_dir: Path) -> bool:
-    """Pin every BEHIND snapshot. False if any classified file changed."""
+    """Pin every BEHIND and FORK snapshot. False if any classified file changed."""
     if plan.unsafe or plan.registration_conflicts:
         return False
-    for item in plan.behind:
+    for item in (*plan.behind, *plan.diverged):
         if not _stage_snapshot_item(item, staging_dir):
             return False
     return True
@@ -2715,7 +2760,7 @@ def stage_ahead_exports(
     plan: SyncPlan,
     session: SyncReadSession,
 ) -> Optional[StagedAhead]:
-    """Export LOCAL_AHEAD chats from the open preflight view into a lease.
+    """Export LOCAL_AHEAD and NEVER_PUSHED chats from the preflight view.
 
     Must be called before the read epoch is closed. Does nothing when the
     plan is unsafe or has no ahead items — no lease is created.

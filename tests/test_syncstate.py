@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from cursor_saves import cli, db, dblock, export, paths, syncstate
+from cursor_saves import cli, db, dblock, export, fork, lineage, paths, syncstate
 
 
 PROJECT_PATH = "/home/user/project"
@@ -105,6 +105,10 @@ def _write_local(conn: sqlite3.Connection, snapshot: dict) -> None:
             "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
             (f"composer.content.{hid}", value),
         )
+    for cpid, checkpoint in (snapshot.get("checkpoints") or {}).items():
+        _put_json(conn, f"checkpointId:{cid}:{cpid}", checkpoint)
+    for ctx_id, context in (snapshot.get("messageContexts") or {}).items():
+        _put_json(conn, f"messageRequestContext:{cid}:{ctx_id}", context)
 
 
 def _write_workspace(ws_dir: Path, snapshots: list[dict]) -> None:
@@ -336,6 +340,68 @@ def _count_backups(monkeypatch):
     return n
 
 
+def _composer_ids(env: dict) -> set[str]:
+    with db.CursorDB(env["global_db"]) as cdb:
+        return {
+            key.split(":", 1)[1]
+            for key in cdb.list_keys("composerData:")
+        }
+
+
+def _composer_data(env: dict, cid: str) -> dict | None:
+    with db.CursorDB(env["global_db"]) as cdb:
+        return cdb.get_json(f"composerData:{cid}")
+
+
+def _active_texts(env: dict, cid: str) -> list[str]:
+    data = _composer_data(env, cid) or {}
+    with db.CursorDB(env["global_db"]) as cdb:
+        texts = []
+        for header in data.get("fullConversationHeadersOnly") or []:
+            bid = header.get("bubbleId")
+            bubble = cdb.get_json(f"bubbleId:{cid}:{bid}") or {}
+            texts.append(bubble.get("text", ""))
+        return texts
+
+
+def _workspace_cids(ws_dir: Path) -> set[str]:
+    with db.CursorDB(ws_dir / "state.vscdb") as cdb:
+        data = cdb.get_json("composer.composerData", table="ItemTable") or {}
+    return {
+        entry["composerId"]
+        for entry in (data.get("allComposers") or [])
+        if isinstance(entry, dict) and entry.get("composerId")
+    }
+
+
+def _snapshot_cids(project_dir: Path) -> set[str]:
+    return {path.name[: -len(".json.gz")] for path in project_dir.glob("*.json.gz")}
+
+
+def _drop_composer(env: dict, cid: str) -> None:
+    conn = sqlite3.connect(str(env["global_db"]))
+    conn.execute("DELETE FROM cursorDiskKV WHERE key = ?", (f"composerData:{cid}",))
+    conn.execute("DELETE FROM cursorDiskKV WHERE key LIKE ?", (f"bubbleId:{cid}:%",))
+    conn.commit()
+    conn.close()
+
+
+def _fork_clone_id(env: dict, original: str) -> str:
+    extras = []
+    for cid in _composer_ids(env) - {original}:
+        name = (_composer_data(env, cid) or {}).get("name") or ""
+        if f"({fork.LOCAL_FORK_SUFFIX})" in name:
+            extras.append(cid)
+    assert len(extras) == 1, extras
+    return extras[0]
+
+
+def _owned_suffixes(env: dict, cid: str, kind: str) -> set[str]:
+    prefix = f"{kind}:{cid}:"
+    with db.CursorDB(env["global_db"]) as cdb:
+        return {key[len(prefix):] for key in cdb.list_keys(prefix)}
+
+
 def test_isolation_never_uses_real_cursor_or_cursaves_dirs():
     isolated_db = paths.get_global_db_path().resolve()
     isolated_snaps = paths.get_snapshots_dir().resolve()
@@ -532,7 +598,7 @@ def test_plan_reuses_parsed_snapshot_cache(sync_env):
 # ── Sync preflight ────────────────────────────────────────────────────
 
 
-def test_diverged_blocks_all_writes(sync_env, monkeypatch):
+def test_fork_does_not_block_other_chats(sync_env, monkeypatch):
     behind_remote = _conversation(
         [_msg(1, "A"), _msg(2, "B"), _msg(3, "C")], composer_id=CID_B, name="Behind"
     )
@@ -540,10 +606,10 @@ def test_diverged_blocks_all_writes(sync_env, monkeypatch):
     ahead_remote = _conversation([_msg(1, "A")], composer_id=CID_C, name="Ahead")
     ahead_local = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_C, name="Ahead")
     diverged_remote = _conversation(
-        [_msg(1, "A"), _msg(2, "B"), _msg(3, "C")], composer_id=CID_D, name="Diverged"
+        [_msg(1, "A"), _msg(2, "B"), _msg(3, "C")], composer_id=CID_D, name="Forked"
     )
     diverged_local = _conversation(
-        [_msg(1, "A"), _msg(2, "B"), _msg(3, "X")], composer_id=CID_D, name="Diverged"
+        [_msg(1, "A"), _msg(2, "B"), _msg(3, "X")], composer_id=CID_D, name="Forked"
     )
     _commit_env(
         sync_env,
@@ -553,36 +619,34 @@ def test_diverged_blocks_all_writes(sync_env, monkeypatch):
     )
 
     backend = _backend(monkeypatch)
-    imports = {"n": 0}
-    saves = {"n": 0}
-    monkeypatch.setattr(cli, "import_snapshot", lambda *a, **k: imports.__setitem__("n", imports["n"] + 1) or True)
-    monkeypatch.setattr(export, "save_snapshot", lambda *a, **k: saves.__setitem__("n", saves["n"] + 1) or Path("x"))
-
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_sync(type("Args", (), {"force": False})())
-    assert exc.value.code == 1
-    assert imports["n"] == 0
-    assert saves["n"] == 0
-    assert backend.pushes == 0
+    cli.cmd_sync(type("Args", (), {"force": False})())
     assert backend.pulls == 1
+    assert _active_texts(sync_env, CID_B) == ["A", "B", "C"]
+    assert _active_texts(sync_env, CID_C) == ["A", "B"]
+    assert _active_texts(sync_env, CID_D) == ["A", "B", "C"]
+    clone_id = _fork_clone_id(sync_env, CID_D)
+    assert _active_texts(sync_env, clone_id) == ["A", "B", "X"]
+    assert CID_D in _workspace_cids(sync_env["ws_dir"])
+    assert clone_id in _workspace_cids(sync_env["ws_dir"])
+    assert CID_D in _snapshot_cids(sync_env["project_dir"])
+    assert clone_id in _snapshot_cids(sync_env["project_dir"])
 
 
-def test_force_does_not_override_divergence(sync_env, monkeypatch, capsys):
-    remote = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Diverged")
-    local = _conversation([_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Diverged")
+def test_force_still_preserves_fork_not_same_cid_merge(sync_env, monkeypatch, capsys):
+    remote = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Forked")
+    local = _conversation([_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Forked")
     _commit_env(sync_env, [local], [remote], digest=False)
     backend = _backend(monkeypatch)
-    imports = {"n": 0}
-    monkeypatch.setattr(cli, "import_snapshot", lambda *a, **k: imports.__setitem__("n", imports["n"] + 1) or True)
 
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_sync(type("Args", (), {"force": True})())
-    assert exc.value.code == 1
+    cli.cmd_sync(type("Args", (), {"force": True})())
     err = capsys.readouterr().err
-    assert "Sync aborted: divergent conversations detected." in err
-    assert "Sync stopped before importing into Cursor or creating/pushing snapshots." in err
-    assert imports["n"] == 0
-    assert backend.pushes == 0
+    assert "divergent conversations detected" not in err
+    assert "Sync aborted" not in err
+    assert backend.pushes == 1
+    assert _active_texts(sync_env, CID_A) == ["A", "B"]
+    clone_id = _fork_clone_id(sync_env, CID_A)
+    assert _active_texts(sync_env, clone_id) == ["A", "X"]
+    assert "(local)" in (_composer_data(sync_env, clone_id) or {}).get("name", "")
 
 
 def test_unknown_snapshot_blocks_writes(sync_env, monkeypatch, capsys):
@@ -609,6 +673,252 @@ def test_unknown_snapshot_blocks_writes(sync_env, monkeypatch, capsys):
     assert imports["n"] == 0
     assert saves["n"] == 0
     assert backend.pushes == 0
+
+
+def test_diverged_plan_is_not_unsafe(sync_env):
+    remote = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Forked")
+    local = _conversation([_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Forked")
+    _commit_env(sync_env, [local], [remote], digest=False)
+    with syncstate.SyncReadSession() as session:
+        plan = syncstate.build_sync_plan(session, syncstate.SnapshotIndex.build())
+    assert [item.composer_id for item in plan.diverged] == [CID_A]
+    assert plan.forks == plan.diverged
+    assert not plan.unsafe
+
+
+def test_rekey_snapshot_keeps_bubble_ids():
+    original = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Chat")
+    cloned = fork.rekey_snapshot(original, CID_E)
+    assert cloned["composerId"] == CID_E
+    assert cloned["composerData"]["composerId"] == CID_E
+    assert cloned["composerData"]["name"] == "Chat (local)"
+    assert cloned["composerData"]["fullConversationHeadersOnly"] == (
+        original["composerData"]["fullConversationHeadersOnly"]
+    )
+    assert set(cloned["bubbleEntries"]) == set(original["bubbleEntries"])
+
+
+def test_compatibility_exception_aborts_sync_without_writes(sync_env, monkeypatch):
+    remote = _conversation([_msg(1, "A"), _msg(2, "C")], composer_id=CID_A, name="Broken")
+    local = _conversation([_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Broken")
+    remote["composerData"]["_v"] = 18
+    local["composerData"]["_v"] = 18
+    _commit_env(sync_env, [local], [remote], digest=False)
+
+    def boom(_bubble):
+        raise TypeError("normalizer exploded")
+
+    monkeypatch.setattr(lineage, "migration_normalize_body", boom)
+    with syncstate.SyncReadSession() as session:
+        plan = syncstate.build_sync_plan(session, syncstate.SnapshotIndex.build())
+    assert plan.unsafe
+
+    leases = {"ahead": 0, "pull": 0}
+    real_lease = db.acquire_lease
+
+    def wrapped(kind):
+        if kind in leases:
+            leases[kind] += 1
+        return real_lease(kind)
+
+    monkeypatch.setattr(db, "acquire_lease", wrapped)
+    monkeypatch.setattr(
+        db, "backup_db", lambda *a, **k: (_ for _ in ()).throw(AssertionError("backup"))
+    )
+    monkeypatch.setattr(
+        cli,
+        "import_snapshot",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("import")),
+    )
+    monkeypatch.setattr(
+        fork,
+        "reconcile_fork",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fork")),
+    )
+    _backend(monkeypatch)
+    before = _composer_ids(sync_env)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_sync(type("Args", (), {"force": False})())
+    assert exc.value.code == 1
+    assert leases["ahead"] == 0
+    assert leases["pull"] == 0
+    assert _composer_ids(sync_env) == before
+    assert _active_texts(sync_env, CID_A) == ["A", "X"]
+
+
+def test_fork_restore_replaces_original_owned_rows(sync_env, monkeypatch):
+    remote = _conversation([_msg(1, "A"), _msg(3, "C")], composer_id=CID_A, name="Forked")
+    local = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Forked")
+    local["bubbleEntries"]["leftover-local"] = {
+        "bubbleId": "leftover-local",
+        "type": 1,
+        "text": "local leftover",
+        "contentHash": "localblob",
+    }
+    local["contentBlobs"]["localblob"] = "local-blob-bytes"
+    local["checkpoints"] = {"cp-local": {"id": "cp-local"}}
+    local["messageContexts"] = {"ctx-local": {"id": "ctx-local"}}
+    remote["bubbleEntries"]["leftover-remote"] = {
+        "bubbleId": "leftover-remote",
+        "type": 1,
+        "text": "remote leftover",
+    }
+    remote["checkpoints"] = {"cp-remote": {"id": "cp-remote"}}
+    remote["messageContexts"] = {"ctx-remote": {"id": "ctx-remote"}}
+    _commit_env(sync_env, [local], [remote], digest=False)
+    _backend(monkeypatch)
+    cli.cmd_sync(type("Args", (), {"force": False})())
+    clone_id = _fork_clone_id(sync_env, CID_A)
+    assert _owned_suffixes(sync_env, clone_id, "bubbleId") == {
+        "bubble-1",
+        "bubble-2",
+        "leftover-local",
+    }
+    assert _owned_suffixes(sync_env, clone_id, "checkpointId") == {"cp-local"}
+    assert _owned_suffixes(sync_env, clone_id, "messageRequestContext") == {"ctx-local"}
+    assert _owned_suffixes(sync_env, CID_A, "bubbleId") == {
+        "bubble-1",
+        "bubble-3",
+        "leftover-remote",
+    }
+    assert _owned_suffixes(sync_env, CID_A, "checkpointId") == {"cp-remote"}
+    assert _owned_suffixes(sync_env, CID_A, "messageRequestContext") == {"ctx-remote"}
+    with db.CursorDB(sync_env["global_db"]) as cdb:
+        assert cdb.get_disk_kv("composer.content.localblob") is not None
+
+
+def test_fork_then_continue_original_export_drops_clone_only_bubbles(
+    sync_env, monkeypatch
+):
+    remote = _conversation([_msg(1, "A"), _msg(3, "C")], composer_id=CID_A, name="Forked")
+    local = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Forked")
+    local["bubbleEntries"]["leftover-local"] = {
+        "bubbleId": "leftover-local",
+        "type": 1,
+        "text": "local leftover",
+    }
+    _commit_env(sync_env, [local], [remote], digest=False)
+    _backend(monkeypatch)
+    cli.cmd_sync(type("Args", (), {"force": False})())
+    clone_id = _fork_clone_id(sync_env, CID_A)
+
+    data = _composer_data(sync_env, CID_A)
+    data["fullConversationHeadersOnly"].append({"bubbleId": "bubble-4", "type": 1})
+    conn = sqlite3.connect(str(sync_env["global_db"]))
+    _put_json(conn, f"composerData:{CID_A}", data)
+    _put_json(
+        conn,
+        f"bubbleId:{CID_A}:bubble-4",
+        {"bubbleId": "bubble-4", "type": 1, "text": "D"},
+    )
+    conn.commit()
+    conn.close()
+
+    with db.CursorDB(sync_env["global_db"]) as cdb:
+        exported = export.export_conversation(PROJECT_PATH, CID_A, _cdb=cdb)
+    assert exported is not None
+    assert set(exported["bubbleEntries"]) == {"bubble-1", "bubble-3", "bubble-4"}
+    assert "leftover-local" not in exported["bubbleEntries"]
+    assert "bubble-2" not in exported["bubbleEntries"]
+    assert _owned_suffixes(sync_env, clone_id, "bubbleId") == {
+        "bubble-1",
+        "bubble-2",
+        "leftover-local",
+    }
+
+
+def test_fork_write_rechecks_local_guard(sync_env):
+    remote = _conversation([_msg(1, "A"), _msg(3, "C")], composer_id=CID_A, name="Forked")
+    local = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Forked")
+    _commit_env(sync_env, [local], [remote], digest=False)
+    with syncstate.SyncReadSession() as session:
+        plan = syncstate.build_sync_plan(session, syncstate.SnapshotIndex.build())
+        item = next(entry for entry in plan.diverged if entry.composer_id == CID_A)
+        local_snap = session.export_conversation(
+            item.project_path,
+            item.composer_id,
+            source_host=item.source_host,
+        )
+    assert item.local_guard is not None
+    assert item.snapshot_path is not None
+    assert local_snap is not None
+    item.staged_path = item.snapshot_path
+
+    conn = sqlite3.connect(str(sync_env["global_db"]))
+    live = json.loads(
+        conn.execute(
+            "SELECT value FROM cursorDiskKV WHERE key = ?",
+            (f"composerData:{CID_A}",),
+        ).fetchone()[0]
+    )
+    live["name"] = "mutated after preflight"
+    _put_json(conn, f"composerData:{CID_A}", live)
+    conn.commit()
+    conn.close()
+
+    result = fork.reconcile_fork(
+        item,
+        local_snap,
+        item.staged_path,
+        sync_env["tmp"] / "fork-stage",
+    )
+    assert result is None
+    assert _composer_ids(sync_env) == {CID_A}
+    assert _active_texts(sync_env, CID_A) == ["A", "B"]
+    assert (_composer_data(sync_env, CID_A) or {}).get("name") == "mutated after preflight"
+    assert syncstate.op_counts().local_guard_skips >= 1
+
+
+def test_fork_reconciliation_next_sync_is_noop(sync_env, monkeypatch):
+    remote = _conversation(
+        [_msg(1, "A"), _msg(2, "B"), _msg(3, "C")], composer_id=CID_A, name="Forked"
+    )
+    local = _conversation(
+        [_msg(1, "A"), _msg(2, "B"), _msg(3, "X")], composer_id=CID_A, name="Forked"
+    )
+    _commit_env(sync_env, [local], [remote], digest=False)
+    _backend(monkeypatch)
+    cli.cmd_sync(type("Args", (), {"force": False})())
+    clone_id = _fork_clone_id(sync_env, CID_A)
+    after_first = _composer_ids(sync_env)
+
+    cli.cmd_sync(type("Args", (), {"force": False})())
+    assert _composer_ids(sync_env) == after_first
+    with syncstate.SyncReadSession() as session:
+        plan = syncstate.build_sync_plan(session, syncstate.SnapshotIndex.build())
+    relations = {item.composer_id: item.relation for item in plan.items}
+    assert relations[CID_A] == syncstate.SyncRelation.UP_TO_DATE
+    assert relations[clone_id] == syncstate.SyncRelation.UP_TO_DATE
+    assert plan.diverged == []
+    assert not plan.unsafe
+
+
+def test_second_peer_imports_fork_without_duplicate(sync_env, monkeypatch):
+    remote = _conversation(
+        [_msg(1, "A"), _msg(2, "B"), _msg(3, "C")], composer_id=CID_A, name="Forked"
+    )
+    local = _conversation(
+        [_msg(1, "A"), _msg(2, "B"), _msg(3, "X")], composer_id=CID_A, name="Forked"
+    )
+    _commit_env(sync_env, [local], [remote], digest=False)
+    _backend(monkeypatch)
+    cli.cmd_sync(type("Args", (), {"force": False})())
+    clone_id = _fork_clone_id(sync_env, CID_A)
+
+    _drop_composer(sync_env, clone_id)
+    _write_workspace(sync_env["ws_dir"], [remote])
+    assert clone_id not in _composer_ids(sync_env)
+
+    cli.cmd_sync(type("Args", (), {"force": False})())
+    assert _composer_ids(sync_env) == {CID_A, clone_id}
+    assert _active_texts(sync_env, CID_A) == ["A", "B", "C"]
+    assert _active_texts(sync_env, clone_id) == ["A", "B", "X"]
+    extras = _composer_ids(sync_env) - {CID_A, clone_id}
+    assert extras == set()
+    with syncstate.SyncReadSession() as session:
+        plan = syncstate.build_sync_plan(session, syncstate.SnapshotIndex.build())
+    assert plan.diverged == []
+    assert {item.relation for item in plan.items} == {syncstate.SyncRelation.UP_TO_DATE}
 
 
 def test_linear_sync_imports_then_releases_then_pushes(sync_env, monkeypatch):
@@ -700,7 +1010,7 @@ def test_op_counts_digest_majority_synced(sync_env, monkeypatch):
     counts = syncstate.op_counts()
     assert counts.snapshot_directory_scans == 1
     assert counts.deep_snapshot_reads == 1
-    assert counts.full_local_exports == 1
+    assert counts.full_local_exports == 2
     assert backups["n"] <= 4
     assert counts.cursor_write_connections == 0
     assert not db.write_connections_open()
@@ -751,7 +1061,23 @@ def test_workspaces_summary_adds_diverged_only_when_needed(sync_env, capsys):
     cli.cmd_workspaces(type("Args", (), {})())
     out = capsys.readouterr().out
     assert "1 synced" in out
-    assert "1 diverged" in out
+    assert "1 fork" in out
+    assert "diverged" not in out
+
+
+def test_status_lists_forks_to_preserve(sync_env, monkeypatch, capsys):
+    remote = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Review")
+    local = _conversation([_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Review")
+    _commit_env(sync_env, [local], [remote], digest=False)
+    monkeypatch.setattr(cli, "_ensure_synced", lambda: None)
+    _backend(monkeypatch)
+    cli.cmd_status(type("Args", (), {"workspace": "1", "project": None})())
+    out = capsys.readouterr().out
+    assert "Forks to preserve:        1" in out
+    assert "Forked conversations: 1" in out
+    assert "Review" in out
+    assert "both branches will be preserved on sync" in out
+    assert "Diverged:" not in out
 
 
 def test_workspaces_summary_unchanged_when_all_synced(sync_env, capsys):
