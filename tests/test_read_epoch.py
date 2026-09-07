@@ -331,9 +331,13 @@ def test_targeted_inventory_matches_full_scan(sync_env):
 
 
 def test_unsafe_sync_does_not_stage_or_write(sync_env, monkeypatch):
-    remote = _conversation([_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="D")
-    local = _conversation([_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="D")
-    _commit_env(sync_env, [local], [remote], digest=False)
+    local = _conversation([_msg(1, "A")], composer_id=CID_A, name="Broken")
+    _commit_env(sync_env, [local], [], digest=False)
+    sync_env["project_dir"].mkdir(parents=True, exist_ok=True)
+    (sync_env["project_dir"] / f"{CID_A}.json.gz").write_bytes(b"not-a-gzip-snapshot")
+    (sync_env["project_dir"] / f"{CID_A}.meta.json").write_text(
+        json.dumps({"composerId": CID_A, "name": "Broken", "messageCount": 1})
+    )
     leases = {"ahead": 0, "pull": 0}
     real_lease = db.acquire_lease
 

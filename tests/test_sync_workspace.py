@@ -15,9 +15,12 @@ from tests.test_syncstate import (
     CID_D,
     PROJECT_PATH,
     WS_HASH,
+    _active_texts,
     _backend,
     _conversation,
+    _fork_clone_id,
     _init_db,
+    _workspace_cids,
     _msg,
     _write_local,
     _write_snapshot_file,
@@ -232,6 +235,48 @@ def test_targeted_sync_pushes_only_selected_ahead(sync_env, monkeypatch):
     assert backend.pushes == 1
 
 
+def test_targeted_sync_pushes_never_pushed_when_bucket_has_snapshots(
+    sync_env, monkeypatch
+):
+    synced = _conversation([_msg(1, "ok")], composer_id=CID_A, name="Synced")
+    never = _conversation([_msg(1, "new")], composer_id=CID_C, name="Never")
+    _add_locals(sync_env["global_db"], [synced, never])
+    _write_workspace(sync_env["ws_dir"], [synced, never])
+    _write_snapshot_file(sync_env["project_dir"], synced, gzip_body=True)
+    _use_workspaces(monkeypatch, [_ws(sync_env["ws_dir"], PROJECT_PATH)])
+    imported, saved = _spy_writes(monkeypatch)
+    backend = _backend(monkeypatch)
+
+    with syncstate.SyncReadSession() as session:
+        index = pull.scoped_snapshot_index(PROJECT_PATH, None)
+        plan = syncstate.build_sync_plan(
+            session, index, target_workspace=_target(_ws(sync_env["ws_dir"], PROJECT_PATH))
+        )
+    relations = {item.composer_id: item.relation for item in plan.items}
+    assert relations[CID_A] == syncstate.SyncRelation.UP_TO_DATE
+    assert relations[CID_C] == syncstate.SyncRelation.NEVER_PUSHED
+    assert CID_C in {item.composer_id for item in plan.ahead}
+
+    cli.cmd_sync(_args(workspace=WS_HASH[:8]))
+    assert imported == []
+    assert saved == [CID_C]
+    assert backend.pushes == 1
+
+
+def test_sync_does_not_push_never_pushed_when_bucket_empty(sync_env, monkeypatch):
+    never = _conversation([_msg(1, "new")], composer_id=CID_C, name="Never")
+    _add_locals(sync_env["global_db"], [never])
+    _write_workspace(sync_env["ws_dir"], [never])
+    _use_workspaces(monkeypatch, [_ws(sync_env["ws_dir"], PROJECT_PATH)])
+    imported, saved = _spy_writes(monkeypatch)
+    backend = _backend(monkeypatch)
+
+    cli.cmd_sync(_args(workspace=WS_HASH[:8]))
+    assert imported == []
+    assert saved == []
+    assert backend.pushes == 0
+
+
 def test_same_cid_in_other_workspace_untouched(sync_env, monkeypatch):
     """A snapshot CID that already lives in workspace B must not enter A."""
     remote_a = _conversation(
@@ -439,26 +484,24 @@ def test_targeted_sync_ignores_other_host_in_legacy_ssh_bucket(sync_env, monkeyp
     assert saved == []
 
 
-def test_selected_divergence_aborts_targeted_sync(sync_env, monkeypatch):
+def test_selected_fork_preserves_both_on_targeted_sync(sync_env, monkeypatch):
     remote = _conversation(
-        [_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Diverged"
+        [_msg(1, "A"), _msg(2, "B")], composer_id=CID_A, name="Forked"
     )
     local = _conversation(
-        [_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Diverged"
+        [_msg(1, "A"), _msg(2, "X")], composer_id=CID_A, name="Forked"
     )
     _add_locals(sync_env["global_db"], [local])
     _write_workspace(sync_env["ws_dir"], [local])
     _write_snapshot_file(sync_env["project_dir"], remote, gzip_body=True)
     _use_workspaces(monkeypatch, [_ws(sync_env["ws_dir"], PROJECT_PATH)])
-    imported, saved = _spy_writes(monkeypatch)
     backend = _backend(monkeypatch)
 
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_sync(_args(workspace=WS_HASH[:8]))
-    assert exc.value.code == 1
-    assert imported == []
-    assert saved == []
-    assert backend.pushes == 0
+    cli.cmd_sync(_args(workspace=WS_HASH[:8]))
+    assert _active_texts(sync_env, CID_A) == ["A", "B"]
+    clone_id = _fork_clone_id(sync_env, CID_A)
+    assert _active_texts(sync_env, clone_id) == ["A", "X"]
+    assert backend.pushes == 1
 
 
 def test_unselected_divergence_does_not_abort_targeted_sync(sync_env, monkeypatch):
@@ -496,7 +539,7 @@ def test_unselected_divergence_does_not_abort_targeted_sync(sync_env, monkeypatc
     assert backend.pushes == 0
 
 
-def test_global_sync_still_aborts_on_unselected_divergence(sync_env, monkeypatch):
+def test_global_sync_preserves_unselected_fork(sync_env, monkeypatch):
     synced = _conversation([_msg(1, "ok")], composer_id=CID_A, name="A-synced")
     diverged_remote = _conversation(
         [_msg(1, "A"), _msg(2, "B")],
@@ -522,15 +565,15 @@ def test_global_sync_still_aborts_on_unselected_divergence(sync_env, monkeypatch
         monkeypatch,
         [_ws(sync_env["ws_dir"], PROJECT_PATH), _ws(ws_b, PATH_B)],
     )
-    imported, saved = _spy_writes(monkeypatch)
     backend = _backend(monkeypatch)
 
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_sync(_args())
-    assert exc.value.code == 1
-    assert imported == []
-    assert saved == []
-    assert backend.pushes == 0
+    cli.cmd_sync(_args())
+    assert _active_texts(sync_env, CID_A) == ["ok"]
+    assert _active_texts(sync_env, CID_D) == ["A", "B"]
+    clone_id = _fork_clone_id(sync_env, CID_D)
+    assert _active_texts(sync_env, clone_id) == ["A", "X"]
+    assert clone_id in _workspace_cids(ws_b)
+    assert backend.pushes == 1
 
 
 def test_unknown_workspace_selector_exits(sync_env, monkeypatch, capsys):

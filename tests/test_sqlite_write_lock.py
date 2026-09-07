@@ -465,7 +465,7 @@ def test_sync_releases_sqlite_before_repo(sqlite_lock, tmp_path, monkeypatch):
         order.append("cursor_write")
         return 1
 
-    def fake_push_ahead(sync_dir, auto=False, backend=None, plan=None, session=None):
+    def fake_push_ahead(*args, **kwargs):
         assert not db.write_connections_open()
         assert not dblock.is_write_lock_held()
         with dblock.repo_lock():
@@ -508,6 +508,7 @@ def test_sync_source_releases_before_push():
     import inspect
 
     src = inspect.getsource(cli.cmd_sync)
+    assert src.index("finish_cursor_writes") < src.index("for cloned in fork_clones")
     assert src.index("finish_cursor_writes") < src.index("_finish_sync_push")
 
 

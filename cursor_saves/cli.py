@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, db, dblock, export, paths, pull, syncstate, typed_headers
+from . import __version__, db, dblock, export, fork, paths, pull, syncstate, typed_headers
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
     copy_between_workspaces,
@@ -28,6 +28,7 @@ from .importer import (
     repair_missing_blobs,
     group_snapshots_by_origin,
     pull_select_import_plan,
+    read_snapshot_file,
     reject_cross_origin_import,
     resolve_sync_import_targets,
     repair_typed_registrations,
@@ -213,7 +214,8 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
     if counts["never_pushed"]:
         parts.append(f"{counts['never_pushed']} not pushed")
     if counts["diverged"]:
-        parts.append(f"{counts['diverged']} diverged")
+        n = counts["diverged"]
+        parts.append(f"{n} fork" if n == 1 else f"{n} forks")
     if counts["unknown"]:
         parts.append(f"{counts['unknown']} unknown")
 
@@ -827,18 +829,21 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
     return total_saved
 
 
-def _finish_sync_push(staged, backend: SyncBackend, snapshots_dir: Path) -> int:
+def _finish_sync_push(
+    staged, backend: SyncBackend, snapshots_dir: Path, extra: int = 0
+) -> int:
     """Promote preflight ahead exports after Cursor writes have been released."""
-    if staged is None:
-        return 0
-    pushed = syncstate.promote_staged_ahead(staged)
-    if backend.has_remote() and pushed:
+    pushed = 0
+    if staged is not None:
+        pushed = syncstate.promote_staged_ahead(staged)
+    total = pushed + extra
+    if backend.has_remote() and total:
         print("  Pushing...", end="", flush=True)
         if backend.push(snapshots_dir):
             print(" done")
         else:
             print(" failed", file=sys.stderr)
-    return pushed
+    return total
 
 
 def _push_ahead_from_plan(
@@ -993,8 +998,8 @@ def _pull_behind(
 ) -> int:
     """Import conversations the preflight plan classified as behind.
 
-    When *plan* is omitted a read-only plan is built first. Diverged or
-    unknown items are never imported here; ``cmd_sync`` aborts first.
+    When *plan* is omitted a read-only plan is built first. Forks are
+    reconciled separately; unknown items abort ``cmd_sync`` first.
     """
     if plan is None:
         with syncstate.SyncReadSession() as session:
@@ -1037,10 +1042,13 @@ def _pull_behind(
         for ws in target_list:
             backup.global_once()
             backup.workspace_once(ws["workspace_dir"])
+            # Preflight already classified BEHIND; do not re-run the
+            # importer's bubble-ID conflict-copy (Office-v18 vs Zeus-v18).
             ok = import_snapshot(
                 snapshot, ws["path"],
                 target_workspace_dir=ws["workspace_dir"],
                 skip_backup=True,
+                skip_conflict=True,
             )
             if ok:
                 total_imported += 1
@@ -1078,20 +1086,8 @@ def cmd_repair(args):
 
 
 def _print_sync_abort(plan: syncstate.SyncPlan) -> None:
-    diverged = plan.diverged
     unknown = plan.unknown
-    if diverged:
-        print("Sync aborted: divergent conversations detected.\n", file=sys.stderr)
-        for item in diverged:
-            print(f"  {item.composer_id[:12]}  {item.name}", file=sys.stderr)
-        print(
-            "\nLocal and snapshot histories are no longer append-only.\n"
-            "Sync stopped before importing into Cursor or creating/pushing snapshots.",
-            file=sys.stderr,
-        )
     if unknown:
-        if diverged:
-            print(file=sys.stderr)
         print("Sync aborted: conversations could not be classified.\n", file=sys.stderr)
         for item in unknown:
             print(f"  {item.composer_id[:12]}  {item.name}", file=sys.stderr)
@@ -1099,6 +1095,62 @@ def _print_sync_abort(plan: syncstate.SyncPlan) -> None:
             "\nSync stopped before importing into Cursor or creating/pushing snapshots.",
             file=sys.stderr,
         )
+
+
+def _export_fork_locals(plan: syncstate.SyncPlan, session: syncstate.SyncReadSession) -> list[tuple]:
+    """Export each forked local branch while the preflight DB copy is open."""
+    exported: list[tuple] = []
+    for item in plan.diverged:
+        snapshot = session.export_conversation(
+            item.project_path,
+            item.composer_id,
+            source_host=item.source_host,
+        )
+        if snapshot is None:
+            raise syncstate.ClassifyError(
+                f"could not export local fork {item.composer_id}"
+            )
+        exported.append((item, snapshot))
+    return exported
+
+
+def _reconcile_forks(
+    exported: list[tuple],
+    staging_dir: Path,
+    backup: Optional[SafetyBackup],
+) -> list[dict]:
+    """Clone each local branch and restore the snapshot onto the original CID."""
+    if not exported:
+        return []
+    if backup is None:
+        backup = SafetyBackup()
+    clones: list[dict] = []
+    items = [item for item, _snap in exported]
+    if any(item.local_guard is None or item.staged_path is None for item in items):
+        raise syncstate.SyncPreflightStale("fork item missing LocalGuard or staged snapshot")
+    if not syncstate.verify_behind_guards(items):
+        raise syncstate.SyncPreflightStale("local Cursor state changed after preflight")
+    print("\n── Forks ──")
+    for item, local_snapshot in exported:
+        backup.global_once()
+        if item.workspace_dir is not None:
+            backup.workspace_once(item.workspace_dir)
+        result = fork.reconcile_fork(
+            item,
+            local_snapshot,
+            item.staged_path,
+            staging_dir,
+        )
+        if result is None:
+            raise syncstate.SyncPreflightStale(
+                f"could not preserve both branches of {item.composer_id}"
+            )
+        new_id, cloned = result
+        print(f"  Preserving both branches of \"{item.name}\"")
+        print(f"    snapshot keeps {item.composer_id[:12]}...")
+        print(f"    local branch copied to {new_id[:12]}...")
+        clones.append(cloned)
+    return clones
 
 
 def _print_registration_conflict_abort(plan: syncstate.SyncPlan) -> None:
@@ -1140,15 +1192,20 @@ def cmd_sync(args):
             print(" failed", file=sys.stderr)
             return
 
-    # Step 2: Read-only preflight. --force does not override divergence.
+    # Step 2: Read-only preflight. --force does not override UNKNOWN/BROKEN.
+    # Forks (same-CID histories that are not safe to merge) are preserved
+    # with keep-both and do not abort the workspace.
     # An empty snapshot bucket still builds the local/registration plan so
     # already-present ACTIVE chats can be repaired. It does not treat every
-    # local chat as a push candidate.
+    # local chat as a push candidate. Once the bucket has snapshots,
+    # never-pushed chats in that origin are exported with LOCAL_AHEAD.
     # ``sync -w`` classifies only that workspace's exact origin.
     session = syncstate.SyncReadSession()
     session_entered = False
     staged = None
     behind_lease = None
+    fork_exports: list = []
+    fork_clones: list[dict] = []
     try:
         target_workspace = None
         if getattr(args, "workspace", None):
@@ -1179,6 +1236,11 @@ def cmd_sync(args):
             sys.exit(1)
 
         try:
+            fork_exports = _export_fork_locals(plan, session) if plan.diverged else []
+        except syncstate.ClassifyError as exc:
+            print(f"Sync aborted: {exc}", file=sys.stderr)
+            sys.exit(1)
+        try:
             staged = (
                 syncstate.stage_ahead_exports(plan, session)
                 if index.by_key
@@ -1191,7 +1253,7 @@ def cmd_sync(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        if plan.behind:
+        if plan.behind or plan.diverged:
             behind_lease = db.acquire_lease("pull")
             if not syncstate.stage_behind_snapshots(plan, behind_lease.path):
                 print(
@@ -1205,17 +1267,29 @@ def cmd_sync(args):
             session.__exit__(None, None, None)
             session_entered = False
 
-        # Step 3: Import — only conversations classified as behind
+        # Step 3: Import — forks first (keep both), then behind
         print("\n── Pull ──")
         imported = 0
         repaired = 0
-        needs_cursor_write = bool(plan.behind) or plan_needs_registration_repair(plan)
+        forked = 0
+        needs_cursor_write = (
+            bool(plan.behind)
+            or bool(plan.diverged)
+            or plan_needs_registration_repair(plan)
+        )
         if needs_cursor_write and pull._cursor_running_blocks(
             getattr(args, "force", False)
         ):
             return
         mutation_backup = SafetyBackup()
         try:
+            if fork_exports:
+                fork_clones = _reconcile_forks(
+                    fork_exports,
+                    behind_lease.path if behind_lease is not None else snapshots_dir,
+                    mutation_backup,
+                )
+                forked = len(fork_clones)
             imported = _pull_behind(sync_dir, plan=plan, backup=mutation_backup)
             repaired = repair_typed_registrations(plan, backup=mutation_backup)
         except syncstate.SyncPreflightStale:
@@ -1234,9 +1308,11 @@ def cmd_sync(args):
             sys.exit(1)
         if imported > 0:
             print(f"  Imported {imported} conversation(s)")
+        if forked > 0:
+            print(f"  Preserved {forked} forked conversation(s)")
         if repaired > 0:
             print(f"  Repaired Cursor registration for {repaired} conversation(s)")
-        if imported == 0 and repaired == 0:
+        if imported == 0 and repaired == 0 and forked == 0:
             print("  Everything up to date")
 
         # Cursor writes from the import phase are committed and connections
@@ -1244,10 +1320,17 @@ def cmd_sync(args):
         # so we never acquire repo.lock while holding sqlite (deadlock).
         db.finish_cursor_writes()
 
+        fork_saved = 0
+        for cloned in fork_clones:
+            export.save_snapshot(cloned, snapshots_dir)
+            fork_saved += 1
+
         # Step 4: Push — promote staged ahead exports, then remote push
         print("\n── Push ──")
         try:
-            pushed = _finish_sync_push(staged, backend, snapshots_dir)
+            pushed = _finish_sync_push(
+                staged, backend, snapshots_dir, extra=fork_saved
+            )
         except syncstate.SyncPreflightStale:
             print(
                 "Sync aborted: a snapshot destination changed after preflight.\n"
@@ -1259,16 +1342,18 @@ def cmd_sync(args):
             print("  Nothing to push")
 
         print()
-        if imported > 0 or pushed > 0 or repaired > 0:
+        if imported > 0 or pushed > 0 or repaired > 0 or forked > 0:
             parts = []
             if imported > 0:
                 parts.append(f"{imported} pulled")
+            if forked > 0:
+                parts.append(f"{forked} fork(s) preserved")
             if repaired > 0:
                 parts.append(f"{repaired} registration(s) repaired")
             if pushed > 0:
                 parts.append(f"{pushed} pushed")
             print(f"Sync complete: {', '.join(parts)}.")
-            if imported > 0 or repaired > 0:
+            if imported > 0 or repaired > 0 or forked > 0:
                 print("Restart Cursor to see imported chats.")
         else:
             print("Already in sync.")
@@ -1599,6 +1684,81 @@ def cmd_copy(args):
         print("Nothing done.")
 
 
+def _resolve_composer_selector(
+    selector: str,
+    *,
+    local_ids: set[str],
+    snapshot_ids: set[str],
+) -> str:
+    """Exact or unique prefix match against local and snapshot composer IDs."""
+    known = local_ids | snapshot_ids
+    if selector in known:
+        return selector
+    matches = sorted(cid for cid in known if cid.startswith(selector))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        print(f"Error: No conversation matching '{selector}'.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Error: Conversation prefix '{selector}' is ambiguous:", file=sys.stderr)
+    for cid in matches[:8]:
+        print(f"  {cid}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_lineage(args):
+    """Read-only v17/v18 compatibility lineage diagnostic. Never writes."""
+    from . import lineage
+
+    with syncstate.SyncReadSession() as session:
+        project_path, workspace_dir, source_host = _resolve_project_and_workspace(
+            args, session=session
+        )
+        project_id = paths.get_project_identifier(project_path, source_host=source_host)
+        index = pull.scoped_snapshot_index(project_path, source_host)
+        lookup_id = index.scoped_project_identifier or project_id
+        local_convos = export.list_conversations(
+            project_path, workspace_dir=workspace_dir, session=session
+        )
+        local_ids = {c["id"] for c in local_convos}
+        snapshot_ids = {rec.composer_id for rec in index.by_key.values()}
+        composer_id = _resolve_composer_selector(
+            args.composer, local_ids=local_ids, snapshot_ids=snapshot_ids
+        )
+        rec = index.get(
+            composer_id,
+            lookup_id,
+            source_host=source_host,
+            source_path=project_path,
+        )
+        if rec is None:
+            print(
+                f"Error: No snapshot for conversation {composer_id}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            local_units = lineage.local_compat_units(session, composer_id)
+            snapshot = read_snapshot_file(rec.path, rec.meta)
+            remote_units = lineage.snapshot_compat_units(snapshot)
+        except (syncstate.ClassifyError, OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        report = lineage.diagnose_lineage(
+            local_units,
+            remote_units,
+            composer_id=composer_id,
+            local_data=session.composer_data(composer_id),
+            remote_data=snapshot.get("composerData"),
+            snapshot=snapshot,
+            session=session,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(report.as_dict(), indent=2))
+        return
+    print(lineage.format_lineage_report(report))
+
+
 def cmd_status(args):
     """Show sync status -- what's local vs what's in snapshots."""
     _ensure_synced()  # Pull latest from remote first
@@ -1712,8 +1872,9 @@ def cmd_status(args):
                     elif health == typed_headers.RegistrationHealth.MISREGISTERED:
                         reg_misregistered += 1
 
-        diverged = 0
+        forks: list[tuple[str, str]] = []
         unknown = 0
+        names_by_id = {c["id"]: c["name"] for c in local_convos}
         if in_both:
             lookup_id = index.scoped_project_identifier or project_id
             for cid in in_both:
@@ -1721,7 +1882,7 @@ def cmd_status(args):
                     session, index, cid, project_identifier=lookup_id
                 )
                 if rel == syncstate.SyncRelation.DIVERGED:
-                    diverged += 1
+                    forks.append((cid, names_by_id.get(cid, "Untitled")))
                 elif rel == syncstate.SyncRelation.UNKNOWN:
                     unknown += 1
         unknown += invalid
@@ -1749,13 +1910,13 @@ def cmd_status(args):
             print(f"  Foreign workspace:       {reg_misregistered}")
     print(f"  Local only (unexported): {len(only_local)}")
     print(f"  Snapshot only (not imported): {len(only_snapshot)}")
-    if diverged:
-        print(f"  Diverged:                 {diverged}")
+    if forks:
+        print(f"  Forks to preserve:        {len(forks)}")
     if unknown:
         print(f"  Unknown:                  {unknown}")
 
     if only_local:
-        print(f"\nLocal only (run 'checkpoint' to export):")
+        print(f"\nLocal only (run 'sync' or 'checkpoint' to export):")
         for c in local_convos:
             if c["id"] in only_local:
                 print(f"  {c['id'][:12]}...  {c['name']}")
@@ -1764,6 +1925,12 @@ def cmd_status(args):
         print(f"\nSnapshot only (run 'import --all' to import):")
         for sid in sorted(only_snapshot):
             print(f"  {sid[:12]}...")
+
+    if forks:
+        print(f"\nForked conversations: {len(forks)}")
+        for cid, name in forks:
+            print(f"  {cid[:12]}...  {name}")
+            print("  -> both branches will be preserved on sync")
 
 
 def cmd_delete(args):
@@ -2267,7 +2434,7 @@ def main():
     )
     p_pull.add_argument(
         "--force", action="store_true",
-        help="Write Cursor even if Cursor is running (does not override divergence)",
+        help="Write Cursor even if Cursor is running (does not import forked or unreadable chats)",
     )
     p_pull.add_argument(
         "--restore-all", action="store_true",
@@ -2281,7 +2448,7 @@ def main():
 
     # ── sync ──────────────────────────────────────────────────────
     p_sync = subparsers.add_parser(
-        "sync", help="Pull behind + push ahead — one command to stay in sync across machines"
+        "sync", help="Pull behind, push ahead, and preserve forked conversations"
     )
     p_sync.add_argument(
         "--workspace", "-w",
@@ -2289,7 +2456,7 @@ def main():
     )
     p_sync.add_argument(
         "--force", action="store_true",
-        help="Suppress the Cursor-running warning (does not override a divergence)",
+        help="Suppress the Cursor-running warning (does not override unreadable data)",
     )
     p_sync.set_defaults(func=cmd_sync)
 
@@ -2344,6 +2511,23 @@ def main():
     p_status = subparsers.add_parser("status", help="Show sync status")
     add_project_args(p_status)
     p_status.set_defaults(func=cmd_status)
+
+    p_lineage = subparsers.add_parser(
+        "lineage",
+        help="Read-only v17/v18 compatibility lineage diagnostic",
+    )
+    add_project_args(p_lineage)
+    p_lineage.add_argument(
+        "--composer",
+        required=True,
+        help="Composer ID or unique prefix",
+    )
+    p_lineage.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the diagnostic report as JSON",
+    )
+    p_lineage.set_defaults(func=cmd_lineage)
 
     # ── watch ────────────────────────────────────────────────────────
     p_watch = subparsers.add_parser(
@@ -2434,6 +2618,7 @@ def main():
             "  list                  List chats for this project\n"
             "  snapshots             List saved snapshots in ~/.cursaves/\n"
             "  status                Show synced vs local-only chats\n"
+            "  lineage --composer ID Read-only v17/v18 lineage diagnostic\n"
             "  doctor                Audit chats, find orphaned conversations\n"
             "  doctor --recover      Re-register orphaned chats in workspaces\n"
             "  migrate               Migrate old chats to Cursor 3.0 index\n"

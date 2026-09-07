@@ -1468,6 +1468,7 @@ def test_task_like_selected_pane_only_is_not_typed(sync_env, monkeypatch):
         data["lastFocusedComposerIds"] = [task_id]
         cdb.write_json("composer.composerData", data, table="ItemTable")
         cdb.write_json(pane_key, {f"agent.view.{task_id}": {}}, table="ItemTable")
+    db.finish_cursor_writes()
     _use_workspaces(monkeypatch, [_ws(sync_env["ws_dir"], PROJECT_PATH)])
     migrated, _already = importer.migrate_to_global_headers(dry_run=True, force=True)
     assert migrated == 4

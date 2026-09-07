@@ -93,7 +93,7 @@ cursaves push -w 497e8ab0   # by hash (from the Hash column)
 cursaves sync -w 497e8ab0
 ```
 
-`push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports only conversations that are missing locally or behind the snapshot. Already-synced and local-ahead chats are left alone, with no Cursor writes. `cursaves pull --restore-all` re-imports every valid snapshot of that exact origin. `sync` does both automatically — pulling conversations where your local copy is behind, and pushing ones where your local copy is ahead. `sync -w` classifies and writes only that workspace; a divergence in another workspace does not abort it. After importing, restart Cursor (quit and reopen) to see the conversations.
+`push` checkpoints your conversations and pushes to the remote. `pull` fetches from the remote and imports only conversations that are missing locally or behind the snapshot. Already-synced and local-ahead chats are left alone, with no Cursor writes. `cursaves pull --restore-all` re-imports every valid snapshot of that exact origin. `sync` does both automatically — pulling conversations where your local copy is behind, pushing ones where your local copy is ahead, and preserving both branches when a conversation has forked. `sync -w` classifies and writes only that workspace. After importing, restart Cursor (quit and reopen) to see the conversations.
 
 For Remote SSH workspaces, always pass `-w` so the host is part of the project identity. `pull -p` / a bare path will not auto-import SSH snapshots.
 
@@ -203,7 +203,7 @@ cursaves pull --restore-all  # re-import every valid snapshot of this origin
 # Then restart Cursor to see the imported conversations
 ```
 
-The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts. If a conversation has diverged (local and snapshot histories are no longer append-only), `sync` aborts before importing or pushing changes. `--force` does not override that. `pull` is directional: it imports the safe behind/missing chats and skips diverged or unreadable ones instead of aborting the whole command.
+The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts. If a conversation has forked (local and snapshot histories are not safe to merge under the same ID), `sync` keeps both branches and continues with the rest of the workspace. Only unreadable or malformed data aborts the command. `pull` is directional: it imports the safe behind/missing chats and skips forked or unreadable ones instead of aborting the whole command.
 
 ## Commands
 
